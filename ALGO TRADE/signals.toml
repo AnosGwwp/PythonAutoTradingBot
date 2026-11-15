@@ -76,6 +76,13 @@ headline_every_sec = 180
 headline_max_per_hour = 6
 bybit_delistings = true    # alert if Bybit announces a delisting of one of your coins
 
+[learn]
+# The bot journals every closed trade (logs/journal.jsonl) and reviews its history: which kinds of
+# trade keep losing. It only SUGGESTS rules; nothing changes until you send /apply N.
+enabled = true
+review_weekday = 6         # weekly review on Telegram: 0 = Monday ... 6 = Sunday (at summary_hour)
+min_trades = 30            # never suggest anything from fewer trades than this
+
 [alerts]
 telegram = true            # uses TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID (environment or .env file)
 log_dir = "logs"

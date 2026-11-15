@@ -5,6 +5,7 @@
   python signals.py once        show any setup on the last closed candle (print only)
   python signals.py backtest    test the rules on history
   python signals.py status      open signals + track record
+  python signals.py review      learn from the history: what works, what keeps losing
   python signals.py telegram    find your Telegram chat id
   options: --pairs BTCUSDT,ETHUSDT  --tf 1h  --trend 4h  --bars 3000  --config signals.toml
 """
@@ -59,7 +60,7 @@ def load(path: str, a) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Trade signal scanner")
-    ap.add_argument("cmd", choices=["scan", "check", "once", "backtest", "status", "telegram"])
+    ap.add_argument("cmd", choices=["scan", "check", "once", "backtest", "status", "review", "telegram"])
     ap.add_argument("--config", default="signals.toml")
     ap.add_argument("--pairs")
     ap.add_argument("--tf")
@@ -93,6 +94,10 @@ def main() -> None:
         backtest.report(cfg)
     elif a.cmd == "status":
         scanner.status(cfg)
+    elif a.cmd == "review":
+        from signalbot import learn
+        from signalbot.notify import plain
+        print(plain(learn.review(cfg)))
     elif a.cmd == "once":
         n = scanner.preview(cfg)
         print(f"\n{n} setup(s) across {len(scanner.all_pairs(cfg))} pairs on the last closed {cfg['entry_tf']} candle.")

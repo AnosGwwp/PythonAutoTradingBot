@@ -8,6 +8,7 @@ Stop goes beyond the recent swing (clamped to an ATR band); targets are R-multip
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 
 from . import indicators as ind
@@ -70,6 +71,10 @@ class Signal:
     traded: bool = False      # auto-traded on the exchange
     qty: float = 0.0          # filled size on the exchange
     traded_at: int = 0        # ms
+    # --- for learning (see learn.py) ---
+    features: dict = field(default_factory=dict)   # indicator values on the signal candle
+    mfe_r: float = 0.0        # best move in our favour while open, in R
+    mae_r: float = 0.0        # worst move against us while open, in R (positive number)
 
     @property
     def d(self) -> int:
@@ -191,8 +196,13 @@ def evaluate(S: Series, i: int, T: Trend, j: int, cfg: dict, symbol: str, tf: st
     reasons.insert(0, f"Bigger trend ({cfg['trend_tf']}) is {'UP' if d == 1 else 'DOWN'}")
     reasons.append(f"Momentum turning {'up' if rs > S.rsi[i - 1] else 'down'} (RSI {rs:.0f})")
     reasons.append(f"{'Strong' if ax >= 25 else 'Moderate'} trend strength (ADX {ax:.0f})")
+    features = {"adx": round(ax, 2), "rsi": round(rs, 2), "vol_ratio": round(vol_ratio, 3),
+                "htf_spread_pct": round(htf_spread * 100, 3),
+                "stretch_atr": round(abs(c[i] - S.e20[i]) / a, 3),     # distance from EMA20
+                "stop_atr": round(dist / a, 3), "atr_pct": round(a / entry * 100, 3),
+                "hour_utc": time.gmtime(S.candles[i].tc / 1000).tm_hour}
     return Signal(symbol, "LONG" if d == 1 else "SHORT", tf, S.candles[i].tc, entry, sl, tps,
-                  score, setups, reasons, a, sl_now=sl, last_t=S.candles[i].t)
+                  score, setups, reasons, a, sl_now=sl, last_t=S.candles[i].t, features=features)
 
 
 def shift_entry(sig: Signal, new_entry: float) -> None:

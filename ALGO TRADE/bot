@@ -10,8 +10,14 @@ case "${1:-}" in
   check)    "$PY" signals.py check ;;
   backtest) "$PY" signals.py backtest ;;
   once)     "$PY" signals.py once ;;
-  update)   # after uploading a new crypto-signals.zip next to this folder
-            unzip -o ../crypto-signals.zip -x 'crypto-signals/.env' 'crypto-signals/logs/*' -d .. \
-              && "$PY" -m unittest discover -s tests -q && sudo systemctl restart $SERVICE && echo "updated + restarted" ;;
+  update)   # git checkout: pull the latest commit. Zip install: unzip a new crypto-signals.zip
+            # uploaded next to this folder. Either way .env, logs/ and phone settings are kept.
+            if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+              git pull --ff-only || { echo "git pull failed (local edits on the VPS? see: git status)"; exit 1; }
+            else
+              unzip -o ../crypto-signals.zip -x 'crypto-signals/.env' 'crypto-signals/logs/*' -d .. || exit 1
+            fi
+            chmod +x bot deploy/install.sh
+            "$PY" -m unittest discover -s tests -q && sudo systemctl restart $SERVICE && echo "updated + restarted" ;;
   *) echo "usage: ./bot logs | status | restart | stop | start | check | backtest | once | update" ;;
 esac

@@ -9,7 +9,8 @@ User=__USER__
 WorkingDirectory=__DIR__
 EnvironmentFile=__DIR__/.env
 Environment=PYTHONUNBUFFERED=1 PYTHONIOENCODING=utf-8
-ExecStart=__PY__ __DIR__/signals.py scan
+# paths are quoted: the git checkout lives in ".../ALGO TRADE" (with a space)
+ExecStart=__PY__ "__DIR__/signals.py" scan
 # restart after a crash or reboot; exit code 2 = "already running", so don't loop on it
 Restart=always
 RestartSec=30
@@ -20,7 +21,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=__DIR__
+ReadWritePaths="__DIR__"
 
 [Install]
 WantedBy=multi-user.target

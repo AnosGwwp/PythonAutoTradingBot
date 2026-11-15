@@ -29,6 +29,9 @@ def update(sig: Signal, k: Candle, fee_pct: float, max_bars: int, bar_ms: int) -
     ev: list[dict] = []
     # bars counted in signal-timeframe units even when tracking on finer candles
     sig.bars = max(sig.bars, int((k.tc - sig.time) // bar_ms))
+    # how far price went for / against us (measured from the entry, in R) - used by learn.py
+    sig.mfe_r = max(sig.mfe_r, d * ((k.h if d == 1 else k.l) - sig.entry) / risk)
+    sig.mae_r = max(sig.mae_r, d * (sig.entry - (k.l if d == 1 else k.h)) / risk)
 
     hit_sl = (k.l <= sig.sl_now) if d == 1 else (k.h >= sig.sl_now)
     if hit_sl:

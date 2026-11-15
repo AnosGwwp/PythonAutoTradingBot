@@ -1,18 +1,16 @@
-# Quick start (Windows)
+# Quick start
 
-| Double-click | What it does |
+The bot runs 24/7 on a VPS as a systemctl service. See [VPS_SETUP.md](VPS_SETUP.md).
+
+| Command | What it does |
 | --- | --- |
-| **Crypto Signals** (desktop icon) or `START SIGNALS.bat` | Starts the scanner. Keep the window open. It restarts itself if it crashes. |
-| `SHOW STATUS.bat` | Shows open trades and your results so far |
-| `AUTOSTART ON.bat` / `AUTOSTART OFF.bat` | Start the scanner automatically (minimized) when you log in to Windows |
-| `PACK FOR VPS.bat` | Build `dist\crypto-signals.zip` to run the bot 24/7 on a server. See [VPS_SETUP.md](VPS_SETUP.md). |
+| `python signals.py scan` | Runs the scanner in the foreground (Ctrl+C to stop). On the VPS the service does this. |
+| `python signals.py status` | Shows open trades and your results so far |
+| `python signals.py check` | Tests market data, Telegram, Bybit keys, the clock and the news feeds |
 
-Run `python signals.py check` at any time to test market data, Telegram, Bybit keys, the clock
-and the news feeds in one go.
-
-Telegram confirms when the scanner starts and when it stops. Starting it twice is harmless:
-the second copy refuses to run, so you never get duplicate alerts. Signals arrive only while
-the PC is on and awake.
+Telegram confirms when the scanner starts and when it stops. Starting it twice on one machine is
+harmless: the second copy refuses to run, so you never get duplicate alerts. Don't run it on your
+PC while the VPS is running it: the bot warns you on Telegram if two machines run it.
 
 ## Phone control (Telegram)
 
@@ -30,9 +28,37 @@ Resume, Help) and answers commands. Type `/` in the chat to see the full menu:
 | `/close BTC`, `/closeall` | Close one trade or all bot trades (on Bybit too) and record the result |
 | `/balance`, `/autotrade on/off` | Bybit equity and positions; switch order placing on or off |
 | `/news`, `/summary` | Upcoming big events, price shocks and headlines; today's results |
+| `/review`, `/apply 1`, `/rules`, `/drop 1` | Learn from the trade history; approve or remove "don't auto-trade" rules |
 
 The bot obeys only your own chat (`TELEGRAM_CHAT_ID`). Phone changes are saved in
 `logs/settings.json` and override `signals.toml`. Delete that file to reset them.
+
+## Learning from its own trades
+
+Every closed trade, auto-traded or alert-only, is added to `logs/journal.jsonl`, which is never
+trimmed. Each entry records the indicator values on the signal candle (ADX, RSI, volume, trend
+strength, distance from the EMA, stop width, time of day), how far price moved for and against
+the trade, and the result.
+
+`/review` (also sent every Sunday at `summary_hour`) looks for kinds of trade that keep losing,
+such as "breakouts on SOL" or "trades with ADX under 20". It shows:
+
+- your live record
+- the same rules over a long backtest
+- the best and worst conditions
+- observations about stops and targets
+
+The bot gets about one signal a day, far too few to judge on live trades alone, so the evidence
+comes from a rolling backtest of the same rules, with your live trades shown alongside.
+
+**It only suggests.** A suggestion needs at least `min_trades` trades, a clearly negative average,
+and losses in both the older and the newer half of the history. Your live trades must not
+contradict it. Anything weaker is mostly bad luck, and acting on it would make the bot worse.
+
+Send `/apply 1` to approve suggestion 1. From then on the bot stops auto-trading that kind of
+setup. You still get the alert, and it is still tracked and journaled, so the review can tell you
+when the condition recovers and suggest `/drop`. `/rules` lists your rules. The bot never raises
+risk, leverage or size by itself. Rules are saved in `logs/settings.json`.
 
 ## News guard
 

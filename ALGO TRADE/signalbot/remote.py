@@ -6,6 +6,7 @@ they survive restarts. Delete that file to go back to signals.toml.
 """
 from __future__ import annotations
 
+import copy
 import html
 import json
 import logging
@@ -17,7 +18,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from . import tracker
+from . import learn, tracker
 from .data import TF_MS, DataError, price
 from .notify import coin, px, r_usd, usd
 
@@ -29,7 +30,8 @@ TREND_FOR = {"15m": "1h", "30m": "4h", "1h": "4h", "2h": "1d", "4h": "1d"}
 KEYS = {"pairs": (None, "pairs"), "watch_pairs": (None, "watch_pairs"), "entry_tf": (None, "entry_tf"),
         "trend_tf": (None, "trend_tf"), "paused": (None, "paused"), "min_score": ("rules", "min_score"),
         "account_size": ("risk", "account_size"), "risk_pct": ("risk", "risk_pct"),
-        "leverage": ("risk", "leverage"), "autotrade": ("trading", "enabled")}
+        "leverage": ("risk", "leverage"), "autotrade": ("trading", "enabled"),
+        "learn_rules": (None, "learn_rules")}
 
 KEYBOARD = {"keyboard": [[{"text": "📊 Status"}, {"text": "📈 Trades"}],
                          [{"text": "💰 Balance"}, {"text": "🔍 Scan now"}],
@@ -46,6 +48,10 @@ COMMAND_MENU = [
     ("balance", "Bybit balance and positions"),
     ("news", "Upcoming big events, price shocks, headlines"),
     ("summary", "Today's results"),
+    ("review", "Learn from the trade history: what works, what loses"),
+    ("rules", "Your approved 'don't auto-trade' rules"),
+    ("apply", "Approve a review suggestion, e.g. /apply 1"),
+    ("drop", "Remove a rule, e.g. /drop 1"),
     ("autotrade", "Auto-trading on Bybit: /autotrade on | off"),
     ("closeall", "Close ALL bot trades on Bybit now"),
     ("scan", "Check all pairs right now"),
@@ -81,6 +87,11 @@ HELP = """🤖 <b>Phone controls</b>
 /autotrade off  — keep alerts, stop placing orders (/autotrade on)
 /closeall  — close every bot trade at market NOW
 /close BTC  — close one trade (on Bybit too)
+
+<b>Learning</b>
+🧠 /review  — what works and what keeps losing (also every week)
+/apply 1  — approve suggestion 1 (stops those auto-trades)
+/rules  ·  /drop 1  — see / remove your rules
 
 <b>Money</b>
 /capital 3000  — your account size in $
@@ -485,6 +496,7 @@ class Remote:
             t = int(time.time() * 1000)
             tracker.close_now(sig, now, t, self.cfg["risk"]["fee_pct"])
             self.st.closed.append(self.st.open.pop(sym))
+            learn.record(self.cfg, sig)
             self.st.cool_until[sym] = t + self.cfg["rules"]["cooldown_bars"] * TF_MS[self.cfg["entry_tf"]]
             self.st.save()
             self.n._csv("CLOSED", sig, f"closed by you @ {now:.8g}")
@@ -527,6 +539,54 @@ class Remote:
         from .scanner import daily_summary
         with self.lock:
             return daily_summary(self.cfg, self.st, self.trader)
+
+    # ---- learning
+    def cmd_review(self, args):
+        self.n.reply("🧠 Reviewing the trade history (about 30 seconds)…")
+        with self.lock:
+            snapshot = copy.deepcopy(self.cfg)
+        return learn.review(snapshot)
+
+    def cmd_apply(self, args):
+        n = _num(args, int)
+        sugg = learn.load_suggestions(settings_path(self.cfg).parent)
+        if not sugg:
+            return "No suggestions to apply. Send /review first."
+        if n is None or not 1 <= n <= len(sugg):
+            return f"Send /apply 1 to {len(sugg)} (the numbers from the last /review)."
+        g = sugg[n - 1]
+        with self.lock:
+            rules = list(self.cfg.get("learn_rules", []))
+            if any(r["id"] == g["id"] for r in rules):
+                return f"That rule is already active: {html.escape(g['label'])}."
+            rules.append({"id": g["id"], "cond": g["cond"], "label": g["label"],
+                          "added": time.strftime("%Y-%m-%d"),
+                          "evidence": f"{g['n']} trades, avg {g['avg']:+.2f}R"})
+            save_setting(self.cfg, "learn_rules", rules)
+        return (f"✅ Rule {len(rules)} added: no more auto-trades for <b>{html.escape(g['label'])}</b>.\n"
+                "You still get those alerts, and they are still tracked, so the review will tell you "
+                "if this condition recovers. /rules to see all, /drop to remove.")
+
+    def cmd_rules(self, args):
+        with self.lock:
+            rules = list(self.cfg.get("learn_rules", []))
+        if not rules:
+            return "🧠 No rules yet. Every signal on a main pair is auto-traded. /review looks for losing patterns."
+        out = ["🧠 <b>Your rules</b> (no auto-trades for these)"]
+        out += [f"{i}. {html.escape(r['label'])}  <i>(added {r.get('added', '?')}: {r.get('evidence', '')})</i>"
+                for i, r in enumerate(rules, 1)]
+        out.append("\n/drop N removes one.")
+        return "\n".join(out)
+
+    def cmd_drop(self, args):
+        n = _num(args, int)
+        with self.lock:
+            rules = list(self.cfg.get("learn_rules", []))
+            if n is None or not 1 <= n <= len(rules):
+                return "Which rule? See /rules, then e.g. <code>/drop 1</code>." if rules else "No rules to drop."
+            gone = rules.pop(n - 1)
+            save_setting(self.cfg, "learn_rules", rules)
+        return f"✅ Rule removed: <b>{html.escape(gone['label'])}</b> is auto-traded again."
 
     def cmd_closeall(self, args):
         with self.lock:

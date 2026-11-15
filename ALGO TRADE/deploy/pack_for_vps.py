@@ -20,9 +20,9 @@ TOP = "crypto-signals"
 FILES = ["signals.py", "signals.toml", "bot", ".env.example", "VPS_SETUP.md",
          "deploy/install.sh", "deploy/crypto-signals.service", "deploy/pack_for_vps.py"]
 GLOBS = ["signalbot/*.py", "tests/test_signals.py", "tests/test_remote.py", "tests/test_trader.py",
-         "tests/test_news_scan.py"]
+         "tests/test_news_scan.py", "tests/test_learn.py"]
 STATE = ["logs/signals_state.json", "logs/settings.json", "logs/signals.csv", "logs/news_seen.json",
-         "logs/calendar.json"]
+         "logs/calendar.json", "logs/journal.jsonl", "logs/learn.json"]
 EXECUTABLE = {"bot", "deploy/install.sh"}
 
 

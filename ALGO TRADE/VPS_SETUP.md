@@ -10,16 +10,38 @@ Bybit's servers are in Singapore, so a nearby region is fastest: Singapore, Toky
 Hong Kong. Frankfurt also works fine. Whatever region you pick, use one where *you* are allowed to
 use Bybit. Step 3 below tests access from the VPS before anything runs.
 
+## Option A: install from GitHub
+
+```
+sudo apt-get update && sudo apt-get install -y git
+git clone https://github.com/<you>/PythonAutoTradingBot.git
+cd "PythonAutoTradingBot/ALGO TRADE"
+bash deploy/install.sh
+```
+
+Then stop the bot on your PC (step 3 below). To update later: push from the PC, then on the VPS
+run `./bot update` (it pulls, runs the tests and restarts).
+
+Your keys, open trades and phone settings are not in git (`.env` and `logs/` are ignored). The
+installer asks for the keys. To carry over open trades and phone settings, copy them from the PC
+before installing:
+
+```
+scp logs\signals_state.json logs\settings.json root@1.2.3.4:~/           (on the PC)
+mkdir -p "logs" && mv ~/signals_state.json ~/settings.json logs/          (on the VPS, in ALGO TRADE)
+```
+
+## Option B: install from a zip
+
 ## 1. Build the package (on your PC)
 
-Double-click **`PACK FOR VPS.bat`**. It asks two questions:
-- **Bring open trades + history?** Answer *y* the first time you move the bot, so the VPS keeps
-  managing trades already open on Bybit.
-- **Include your keys?** *y* saves retyping them. The zip then contains secrets: don't share it,
-  and delete it after uploading.
+```
+python deploy\pack_for_vps.py                 code + config
+python deploy\pack_for_vps.py --with-state    + open trades, history and phone settings (first move)
+python deploy\pack_for_vps.py --with-secrets  + your keys in .env (don't share the zip; delete it after uploading)
+```
 
-This creates `dist\crypto-signals.zip`. It contains only what the VPS needs: no Flint bot, no .bat
-files, no logs.
+This creates `dist\crypto-signals.zip`. It contains only what the VPS needs: no Flint bot, no logs.
 
 ## 2. Upload and unzip
 
@@ -50,9 +72,8 @@ You get a Telegram message from the VPS when it's running.
 
 ## 3. Stop the bot on your PC (important)
 
-**Only one copy may run at a time.** Two copies could open double trades. On the PC:
-- close the bot window, then
-- double-click `AUTOSTART OFF.bat`.
+**Only one copy may run at a time.** Two copies could open double trades. On the PC, close the
+bot window (or press Ctrl+C in it).
 
 If both run anyway, the bot warns you on Telegram: "Two copies of this bot are running".
 
@@ -70,7 +91,9 @@ Everything else works from your phone as before.
 
 ## Updating to a new version
 
-On the PC, run `PACK FOR VPS.bat` and answer **n** to both questions. Upload the zip, then on the VPS:
+From GitHub: push from the PC, then run `./bot update` on the VPS.
+
+From a zip: on the PC, run `python deploy\pack_for_vps.py`. Upload the zip, then on the VPS:
 
 ```
 scp "dist\crypto-signals.zip" root@1.2.3.4:~     (on the PC)

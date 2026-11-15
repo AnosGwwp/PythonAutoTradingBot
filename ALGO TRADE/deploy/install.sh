@@ -54,7 +54,12 @@ sed -e "s|__USER__|$(id -un)|g" -e "s|__DIR__|$BOT_DIR|g" -e "s|__PY__|$PY|g" de
 sudo systemctl daemon-reload
 sudo systemctl enable $SERVICE >/dev/null
 sudo systemctl restart $SERVICE
-sleep 3
+sleep 5
+if ! systemctl is-active --quiet $SERVICE; then
+  echo "The service did not start. Its last log lines:"
+  journalctl -u $SERVICE -n 30 --no-pager --output=cat || true
+  exit 1
+fi
 systemctl --no-pager --lines=0 status $SERVICE | head -5 || true
 echo
 echo "Done. The bot runs 24/7, restarts after crashes and reboots, and messages you on Telegram."

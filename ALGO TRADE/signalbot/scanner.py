@@ -8,6 +8,7 @@ State survives restarts (logs/signals_state.json).
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -18,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from . import tracker
+from . import learn, tracker
 from .data import TF_MS, CandleCache, DataError, candles
 from .news import News
 from .notify import Notifier, coin, format_signal, px, r_usd, sizing, usd
@@ -113,6 +114,7 @@ def scan_once(cfg: dict, st: State, notifier: Notifier, force: bool = False, tra
             if sig.status == "closed":
                 st.closed.append(st.open.pop(pair))
                 st.cool_until[pair] = now + r["cooldown_bars"] * bar_ms
+                learn.record(cfg, sig)
                 break
 
     # 1b. trades you closed yourself in the Bybit app
@@ -120,6 +122,7 @@ def scan_once(cfg: dict, st: State, notifier: Notifier, force: bool = False, tra
         for sig, price in trader.sync(list(st.open.values())):
             tracker.close_now(sig, price, now, cfg["risk"]["fee_pct"], "closed on Bybit")
             st.closed.append(st.open.pop(sig.symbol))
+            learn.record(cfg, sig)
             st.cool_until[sig.symbol] = now + r["cooldown_bars"] * bar_ms
             notifier.event(sig, {"kind": "closed", "price": price, "why": "closed on Bybit"})
 
@@ -159,6 +162,9 @@ def scan_once(cfg: dict, st: State, notifier: Notifier, force: bool = False, tra
                 sig.last_t = last_close - 1   # track from the next minute on
                 sig.risk_usd = sizing(sig, cfg)["risk_amt"]
                 block = news.block_reason(pair, now) if news else ""
+                rule = learn.matching_rule(sig, cfg) if not block else None
+                if rule:
+                    block = f"your rule: skip {rule['label']} (losing in the history; /rules)"
                 if block:
                     note = (f"🤖 Not auto-traded: {block}." if trader and trader.active
                             else f"⚠️ Careful: {block}. Consider skipping this one.")
@@ -218,6 +224,13 @@ def daily_summary(cfg: dict, st: State, trader: Trader | None) -> str:
         except Exception:
             pass
     return "\n".join(lines)
+
+
+def _weekly_review(cfg: dict, notifier: Notifier) -> None:
+    try:
+        notifier.info(learn.review(cfg))
+    except Exception:
+        log.exception("weekly review failed")
 
 
 ALREADY_RUNNING = 2
@@ -334,6 +347,18 @@ def run(cfg: dict) -> int:
                     st.save()
                     text = daily_summary(cfg, st, trader)
                 notifier.info(text)
+
+            # weekly learning review (in the background: it downloads history and backtests)
+            lc = cfg.get("learn", {})
+            if lc.get("enabled", True) and 0 <= summary_hour <= 23 \
+                    and time.localtime().tm_wday == lc.get("review_weekday", 6) \
+                    and time.localtime().tm_hour == summary_hour and st.meta.get("review_day") != today:
+                with lock:
+                    st.meta["review_day"] = today
+                    st.save()
+                    snapshot = copy.deepcopy(cfg)
+                threading.Thread(target=_weekly_review, args=(snapshot, notifier),
+                                 name="weekly-review", daemon=True).start()
 
             if t0 - last_beat > 900:
                 last_beat = t0

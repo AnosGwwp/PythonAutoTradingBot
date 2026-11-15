@@ -151,8 +151,10 @@ def coin_patterns(coins: list[str]) -> dict[str, re.Pattern]:
     out = {}
     for c in coins:
         names = "|".join(re.escape(n) for n in NAMES.get(c, []))
-        # ticker must be UPPERCASE as a whole word (so "sol" in normal text doesn't match)
-        out[c] = re.compile(rf"(?<![A-Za-z]){re.escape(c)}(?![A-Za-z])" + (rf"|(?i:\b({names})\b)" if names else ""))
+        # ticker must be UPPERCASE as a whole word (so "sol" in normal text doesn't match), optionally
+        # glued to a contract suffix: Bybit delisting notices name the contract ("SOLUSDT Perpetual")
+        out[c] = re.compile(rf"(?<![A-Za-z]){re.escape(c)}(?:USDT|USDC|USD|PERP)?(?![A-Za-z])"
+                            + (rf"|(?i:\b({names})\b)" if names else ""))
     return out
 
 

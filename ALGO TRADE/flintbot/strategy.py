@@ -84,17 +84,26 @@ class VolEstimator:
         return math.sqrt((self.var_rate or 0.0) * horizon_sec)
 
 
-def _strip_own(levels: tuple[Level, ...], own: dict[float, float]) -> list[Level]:
-    """Remove our own resting size from the public book so we don't chase ourselves."""
-    out = []
-    for lv in levels:
-        size = lv.size
-        for px, sz in own.items():
-            if abs(lv.price - px) <= 1e-9 * max(1.0, px):
-                size -= sz
-        if size > 1e-12:
-            out.append(Level(lv.price, size))
-    return out
+OWN_MATCH_BPS = 0.5   # on-chain prices are tick-rounded, so our float prices never match exactly
+
+
+def _strip_own(levels: tuple[Level, ...], own: dict[float, float],
+               tol_bps: float = OWN_MATCH_BPS) -> list[Level]:
+    """Remove our own resting size from the public book so we don't chase ourselves.
+
+    Each of our levels is matched to the NEAREST book level within tol_bps (our levels sit at
+    least step_bps apart, far more than the tolerance) and only our size is subtracted there, so
+    other makers' size at that price is kept."""
+    sizes = [lv.size for lv in levels]
+    for px, sz in own.items():
+        best, best_d = None, bps(tol_bps) * px
+        for i, lv in enumerate(levels):
+            d = abs(lv.price - px)
+            if d <= best_d:
+                best, best_d = i, d
+        if best is not None:
+            sizes[best] -= sz
+    return [Level(lv.price, s) for lv, s in zip(levels, sizes) if s > 1e-12]
 
 
 def microprice(book: Book, own_bids: dict[float, float] | None = None,

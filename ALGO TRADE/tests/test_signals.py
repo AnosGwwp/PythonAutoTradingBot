@@ -39,6 +39,20 @@ class TrackerTests(unittest.TestCase):
         tracker.update(s, k(2, 102, 102.2, 99.9, 100), 0.0, 48, H)
         self.assertAlmostEqual(s.realized_r, 1 / 3)       # 1/3 at +1R, rest at breakeven
 
+    def test_tp_touch_is_not_a_fill(self):
+        s = sig()
+        tracker.update(s, k(1, 100, 102.0, 99.5, 101), 0.0, 48, H)   # high == TP1 exactly
+        self.assertEqual(s.tp_hit, 0)
+        tracker.update(s, k(2, 101, 102.01, 100.5, 101), 0.0, 48, H)  # traded through
+        self.assertEqual(s.tp_hit, 1)
+
+    def test_close_back_through_moved_stop(self):
+        s = sig()
+        ev = tracker.update(s, k(1, 100, 102.5, 99.0, 99.8), 0.0, 48, H)  # TP1, then closed below entry
+        self.assertEqual([e["kind"] for e in ev], ["tp", "stop"])
+        self.assertEqual(s.exit_reason, "stop after TP1")
+        self.assertAlmostEqual(s.realized_r, 1 / 3)                 # 1/3 at +1R, rest at breakeven
+
     def test_same_candle_stop_first(self):
         s = sig()
         tracker.update(s, k(1, 100, 106.5, 97.0, 100), 0.0, 48, H)

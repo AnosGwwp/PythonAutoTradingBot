@@ -18,6 +18,7 @@ HOSTS = {"demo": "https://api-demo.bybit.com",          # demo trading: real pri
          "mainnet": "https://api.bybit.com"}
 
 OK_CODES = {0, 110043, 110025, 34040}   # 0 ok; "leverage/position mode/SL not modified" are fine
+UNCERTAIN = -1   # network failure, timeout or HTTP 5xx: Bybit may or may not have executed the request
 
 
 class BybitError(RuntimeError):
@@ -74,11 +75,14 @@ class Bybit:
             with urllib.request.urlopen(req, timeout=15) as r:
                 body = json.loads(r.read())
         except urllib.error.HTTPError as e:
-            raise BybitError(e.code, e.read()[:200].decode(errors="replace")) from e
+            body = e.read()[:200].decode(errors="replace")
+            if e.code >= 500:   # gateway/server error: the request may still have been executed
+                raise BybitError(UNCERTAIN, f"HTTP {e.code} (outcome unknown): {body}") from e
+            raise BybitError(e.code, f"HTTP {e.code}: {body}") from e
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
-            raise BybitError(-1, f"network: {e}") from e
+            raise BybitError(UNCERTAIN, f"network: {e}") from e
         except json.JSONDecodeError as e:
-            raise BybitError(-1, f"bad response: {e}") from e
+            raise BybitError(UNCERTAIN, f"bad response: {e}") from e
         code = body.get("retCode", -1)
         if code not in OK_CODES:
             raise BybitError(code, body.get("retMsg", ""))
@@ -126,6 +130,12 @@ class Bybit:
             if float(p.get("size") or 0) > 0:
                 return {"side": p["side"], "size": float(p["size"]), "avg": float(p.get("avgPrice") or 0)}
         return None
+
+    def closed_pnl(self, symbol: str | None = None, start_ms: int | None = None, limit: int = 100) -> list[dict]:
+        """Realized P&L records (newest first), one per closing fill, fees included."""
+        r = self.get("/v5/position/closed-pnl", category="linear", symbol=symbol, startTime=start_ms,
+                     limit=min(limit, 100))
+        return r.get("list", [])
 
     # ---------------------------------------------------------------- market info
     def instrument(self, symbol: str) -> dict:

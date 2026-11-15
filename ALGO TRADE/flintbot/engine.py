@@ -80,6 +80,7 @@ async def run(cfg: Config, live: bool = False, check_only: bool = False,
     last_status = 0.0
     t_start = time.monotonic()
     kill_reason = ""
+    submit_errors = 0          # consecutive failed install/update/pull calls
 
     try:
         while True:
@@ -102,9 +103,9 @@ async def run(cfg: Config, live: bool = False, check_only: bool = False,
                     book, fills = await book_src.book(pair.label), []
                     await ex.balances()
                 risk.record_success()
-            except (FeedError, OSError, asyncio.TimeoutError) as e:
+            except Exception as e:     # FeedError, network, or an SDK/gRPC error in live mode
                 v = risk.record_error()
-                log.warning("data error: %s", e)
+                log.warning("data error: %s: %s", type(e).__name__, e)
                 if v.action == KILL:
                     kill_reason = v.reason
                     break
@@ -133,9 +134,17 @@ async def run(cfg: Config, live: bool = False, check_only: bool = False,
                 break
             if v.action == PAUSE:
                 if quoting:
-                    await ex.pull()
-                    quoting = False
-                    need_install = live      # live: re-enable requires a params update
+                    try:
+                        await ex.pull()
+                        quoting = False
+                        need_install = live      # live: re-enable requires a params update
+                        submit_errors = 0
+                    except Exception as e:       # retried next tick; on-chain staleness still
+                        submit_errors += 1       # stops our levels filling meanwhile
+                        log.warning("pull failed (%d in a row): %s: %s", submit_errors, type(e).__name__, e)
+                        if submit_errors >= cfg.max_consecutive_errors:
+                            kill_reason = f"{submit_errors} failed submissions in a row"
+                            break
                 if v.reason != last_pause_reason:
                     log.info("PAUSE: %s", v.reason)
                     journal.write("pause", reason=v.reason)
@@ -145,26 +154,45 @@ async def run(cfg: Config, live: bool = False, check_only: bool = False,
             last_pause_reason = ""
 
             # ---- 4. quote: install ladder rarely, push fairs only when needed ----
-            if need_install or strat.ladder_stale(mid):
-                ladder = strat.build_ladder(mid)
-                q = strat.compute(mid, now, ex.inventory(), ex.spread_mult())
-                await ex.install(ladder, q, book.ts, with_risk=first_install)
-                first_install = need_install = False
-                n_installs += 1
-                journal.write("install", price=mid, offsets=list(ladder.offsets),
-                              sizes=[str(s) for s in ladder.sizes])
-                sent, sent_ts, quoting = q, now, True
-            else:
-                q = strat.compute(mid, now, ex.inventory(), ex.spread_mult())
-                if not quoting or needs_requote(q, sent, now - sent_ts, cfg):
-                    await ex.update(q, book.ts)
+            # A failed submission (SDK error, landing timeout) is retried next tick: need_install
+            # stays set and `sent` is unchanged, so the same decision is made again.
+            installing = need_install or strat.ladder_stale(mid)
+            try:
+                if installing:
+                    ladder = strat.build_ladder(mid)
+                    q = strat.compute(mid, now, ex.inventory(), ex.spread_mult())
+                    await ex.install(ladder, q, book.ts, with_risk=first_install)
+                    first_install = need_install = False
+                    n_installs += 1
+                    journal.write("install", price=mid, offsets=list(ladder.offsets),
+                                  sizes=[str(s) for s in ladder.sizes])
                     sent, sent_ts, quoting = q, now, True
-                    n_updates += 1
+                else:
+                    q = strat.compute(mid, now, ex.inventory(), ex.spread_mult())
+                    if not quoting or needs_requote(q, sent, now - sent_ts, cfg):
+                        await ex.update(q, book.ts)
+                        sent, sent_ts, quoting = q, now, True
+                        n_updates += 1
+                submit_errors = 0
+            except Exception as e:
+                submit_errors += 1
+                need_install = need_install or installing    # strat.ladder already holds the new one
+                log.warning("submission failed (%d in a row): %s: %s", submit_errors, type(e).__name__, e)
+                journal.write("submit_error", error=f"{type(e).__name__}: {e}")
+                if submit_errors >= cfg.max_consecutive_errors:
+                    kill_reason = f"{submit_errors} failed submissions in a row"
+                    break
+                await _sleep_rest(t0, cfg.tick_sec)
+                continue
 
             # ---- 5. status ----
             if now - last_status >= cfg.status_every_sec:
                 last_status = now
-                b, qb = await ex.balances()
+                try:
+                    b, qb = await ex.balances()
+                except Exception as e:          # status only: never stop quoting over it
+                    log.warning("balances unavailable: %s", e)
+                    b, qb = float("nan"), float("nan")
                 bb, ba = book.best_bid, book.best_ask
                 log.info("mid %.6g | book %s/%s | quote %.6g/%.6g | half %.1fbps vol %.1fbps "
                          "| inv %+.4f | %s %.6g %s %.6g | pnl %+.5f | pushes %d installs %d",

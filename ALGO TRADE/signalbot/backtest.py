@@ -2,6 +2,8 @@
 
 A signal on candle i is filled at candle i+1's OPEN (what you'd realistically get),
 then managed by tracker.update() on each following candle. Fees are included.
+Like the auto-trader, it skips a signal whose fill would chase price past the "don't chase" level.
+Not modelled: news pauses, max_open_trades / max_same_direction across pairs, and funding fees.
 """
 from __future__ import annotations
 
@@ -10,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from . import tracker
 from .data import TF_MS, candles
-from .strategy import evaluate, prepare, prepare_trend, shift_entry, trend_index
+from .strategy import CHASE_ATR, evaluate, prepare, prepare_trend, shift_entry, trend_index
 
 log = logging.getLogger("signals")
 
@@ -28,7 +30,8 @@ def run_pair(symbol: str, cfg: dict) -> list:
         if open_sig is not None:
             tracker.update(open_sig, k, fee, r["max_bars_open"], bar_ms)
             if open_sig.status == "closed":
-                trades.append(open_sig)
+                if open_sig.traded:
+                    trades.append(open_sig)
                 open_sig, cool_until = None, i + r["cooldown_bars"]
             continue
         if i < cool_until or i + 1 >= len(S.candles):
@@ -36,7 +39,12 @@ def run_pair(symbol: str, cfg: dict) -> list:
         j = max(0, trend_index(T, k.tc, j))
         sig = evaluate(S, i, T, j, cfg, symbol, tf)
         if sig:
-            shift_entry(sig, S.candles[i + 1].o)    # realistic fill at next open
+            fill = S.candles[i + 1].o                # realistic fill at next open
+            chased = (sig.d * (fill - (sig.entry + sig.d * CHASE_ATR * sig.atr)) > 0
+                      or sig.d * (fill - sig.sl) <= 0)
+            if not chased:                           # the auto-trader skips chased ones; live they
+                shift_entry(sig, fill)               # are still alerted and tracked, keeping the pair
+                sig.traded = True                    # busy, so follow them but leave them out of stats
             open_sig = sig
     return trades
 

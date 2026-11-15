@@ -14,7 +14,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from .strategy import Signal
+from .strategy import CHASE_ATR, Signal
 
 log = logging.getLogger("signals")
 
@@ -112,6 +112,18 @@ def env(name: str) -> str:
         return ""
 
 
+def console(text: str) -> None:
+    """Print without ever raising: an emoji on a non-UTF-8 console (or a missing console) must not
+    abort a scan and lose the Telegram alert that follows."""
+    try:
+        print(text, flush=True)
+    except (UnicodeEncodeError, OSError, ValueError, AttributeError):
+        try:
+            print(text.encode("ascii", "replace").decode("ascii"), flush=True)
+        except Exception:
+            pass
+
+
 def plain(text: str) -> str:
     return html.unescape(re.sub(r"<[^>]+>", "", text))
 
@@ -125,7 +137,7 @@ def signal_message(sig: Signal, cfg: dict, note: str = "") -> str:
         s["risk_pct"] = sig.risk_usd / s["acct"] * 100
     long = sig.side == "LONG"
     pct = lambda p: f"{(p / sig.entry - 1) * 100:+.1f}%"
-    chase = sig.entry + sig.d * 0.25 * sig.atr
+    chase = sig.entry + sig.d * CHASE_ATR * sig.atr
     when = time.strftime("%H:%M", time.localtime(sig.time / 1000))
     head = f"{'🟢' if long else '🔴'} <b>{'LONG' if long else 'SHORT'}  {coin(sig.symbol)}</b>  ·  {sig.tf} chart"
     if is_watch(sig, cfg):
@@ -271,19 +283,19 @@ class Notifier:
 
     def signal(self, sig: Signal, note: str = "") -> None:
         msg = signal_message(sig, self.cfg, note)
-        print("\n" + "=" * 60 + "\n" + plain(msg) + "\n" + "=" * 60, flush=True)
-        self._csv("NEW", sig, "auto-traded" if sig.traded else "")
+        console("\n" + "=" * 60 + "\n" + plain(msg) + "\n" + "=" * 60)
         self._telegram(msg, silent=is_watch(sig, self.cfg) and not sig.traded)
+        self._csv("NEW", sig, "auto-traded" if sig.traded else "")
 
     def event(self, sig: Signal, ev: dict, note: str = "") -> None:
         msg = event_message(sig, ev, self.cfg, note)
-        print(">> " + plain(msg).replace("\n", " | "), flush=True)
-        self._csv("CLOSED" if sig.status == "closed" else "UPDATE", sig, event_text(ev))
+        console(">> " + plain(msg).replace("\n", " | "))
         self._telegram(msg, silent=is_watch(sig, self.cfg) and not sig.traded)
+        self._csv("CLOSED" if sig.status == "closed" else "UPDATE", sig, event_text(ev))
 
     def info(self, text: str, keyboard: dict | None = None) -> None:
         """Status message (silent notification)."""
-        print(plain(text), flush=True)
+        console(plain(text))
         self._telegram(text, silent=True, keyboard=keyboard)
 
     def reply(self, text: str, keyboard: dict | None = None) -> None:
@@ -292,20 +304,32 @@ class Notifier:
 
     def alert(self, text: str) -> None:
         """Important warning (with sound)."""
-        print(plain(text), flush=True)
+        console(plain(text))
         self._telegram(text, silent=False)
 
     def _csv(self, kind: str, sig: Signal, event: str) -> None:
-        new = not self.csv.exists()
-        with self.csv.open("a", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            if new:
-                w.writerow(["logged", "kind", "symbol", "side", "tf", "signal_time", "entry", "sl",
-                            "tps", "score", "setups", "event", "realized_r"])
-            w.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), kind, sig.symbol, sig.side, sig.tf,
-                        time.strftime("%Y-%m-%d %H:%M", time.localtime(sig.time / 1000)),
-                        sig.entry, sig.sl, json.dumps([round(t, 10) for t in sig.tps]), sig.score,
-                        "+".join(sig.setups), event, round(sig.realized_r, 3)])
+        """Append to the CSV journal. Never raises: on Windows the file is locked while it is open
+        in Excel, and a journal row must not abort a scan (and with it alerts or Bybit follow-ups)."""
+        row = [time.strftime("%Y-%m-%d %H:%M:%S"), kind, sig.symbol, sig.side, sig.tf,
+               time.strftime("%Y-%m-%d %H:%M", time.localtime(sig.time / 1000)),
+               sig.entry, sig.sl, json.dumps([round(t, 10) for t in sig.tps]), sig.score,
+               "+".join(sig.setups), event, round(sig.realized_r, 3)]
+        for attempt in range(3):
+            try:
+                new = not self.csv.exists()
+                with self.csv.open("a", newline="", encoding="utf-8") as f:
+                    w = csv.writer(f)
+                    if new:
+                        w.writerow(["logged", "kind", "symbol", "side", "tf", "signal_time", "entry", "sl",
+                                    "tps", "score", "setups", "event", "realized_r"])
+                    w.writerow(row)
+                return
+            except OSError as e:
+                if attempt == 2:
+                    log.warning("could not write %s (open in Excel?): %s. Row skipped: %s",
+                                self.csv, e, ",".join(map(str, row)))
+                    return
+                time.sleep(0.2)
 
     def _telegram(self, text: str, silent: bool = False, keyboard: dict | None = None) -> None:
         if not self.tg:

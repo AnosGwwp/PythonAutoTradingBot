@@ -38,6 +38,27 @@ class NewsTest(unittest.TestCase):
         self.assertFalse(p["SOL"].search("Solar panels are cheap"))
         self.assertFalse(p["SOL"].search("the sol of it"))       # lowercase ticker isn't a match
 
+    def test_delisting_names_the_contract(self):
+        p = news.coin_patterns(["SOL", "ARB"])
+        self.assertTrue(p["SOL"].search("Bybit Will Delist the SOLUSDT Perpetual Contract"))
+        self.assertTrue(p["ARB"].search("Delisting of ARBUSDT, XYZUSDT Perpetual Contracts"))
+        self.assertTrue(p["ARB"].search("Delisting of ARB/USDT Spot Trading Pair"))
+        self.assertFalse(p["SOL"].search("Delisting of SOLVUSDT Perpetual Contract"))   # other coin
+
+
+class NotifierTest(unittest.TestCase):
+    def test_locked_csv_never_breaks_a_scan(self):
+        from signalbot.notify import Notifier
+        with tempfile.TemporaryDirectory() as t:
+            n = Notifier({"alerts": {"log_dir": t, "telegram": False}, "risk": {"account_size": 3000,
+                          "risk_pct": 1, "leverage": 10}})
+            n.csv = Path(t) / "locked"
+            n.csv.mkdir()                                          # opening a folder fails like a lock
+            s = Signal("BTCUSDT", "LONG", "1h", 0, 100, 98.5, [101.5], 70, ["pullback"], ["x"], 1, sl_now=98.5)
+            with mock.patch.object(time, "sleep"), self.assertLogs("signals", "WARNING"):
+                n.signal(s)                                        # must not raise
+                n.event(s, {"kind": "done"})
+
     def test_headline_importance_and_first_run_quiet(self):
         with tempfile.TemporaryDirectory() as t:
             h = news.Headlines({"news": {}}, Path(t) / "seen.json")

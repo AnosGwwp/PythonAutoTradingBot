@@ -13,6 +13,9 @@ from dataclasses import dataclass, field
 from . import indicators as ind
 from .data import Candle
 
+# Don't enter once price has run this many ATRs past the signal close (alerts, auto-trader, backtest).
+CHASE_ATR = 0.25
+
 
 @dataclass
 class Series:

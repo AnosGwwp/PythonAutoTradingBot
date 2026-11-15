@@ -65,6 +65,29 @@ class FeedError(RuntimeError):
     pass
 
 
+def _decode(raw: bytes) -> dict:
+    """JSON-RPC reply as plain JSON, or as a Server-Sent Events stream (we accept both)."""
+    text = raw.decode("utf-8").strip()
+    if text.startswith(("event:", "data:", "id:", ":")):
+        data = [ln[5:].strip() for ln in text.splitlines() if ln.startswith("data:")]
+        if not data:
+            raise ValueError("event stream without data")
+        return json.loads(data[-1])
+    return json.loads(text)
+
+
+def _parsed(fn):
+    """Turn a missing field / bad number in a reply into FeedError, which the engine counts as a
+    data error, instead of an exception that ends the run."""
+    async def wrapper(*a, **kw):
+        try:
+            return await fn(*a, **kw)
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError) as e:
+            raise FeedError(f"{fn.__name__}: unexpected data ({type(e).__name__}: {e})") from e
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
 class McpFeed:
     def __init__(self, url: str, timeout: float = 10.0):
         u = urlparse(url)
@@ -103,19 +126,23 @@ class McpFeed:
                 self._local.conn = None
                 if attempt == 2:
                     raise FeedError(f"{tool}: {e}") from e
-        msg = json.loads(raw)
-        if "error" in msg:
-            raise FeedError(f"{tool}: {msg['error']}")
-        res = msg["result"]
-        text = res["content"][0]["text"]
-        if res.get("isError"):
-            raise FeedError(f"{tool}: {text}")
-        return json.loads(text)
+        try:
+            msg = _decode(raw)
+            if "error" in msg:
+                raise FeedError(f"{tool}: {msg['error']}")
+            res = msg["result"]
+            text = res["content"][0]["text"]
+            if res.get("isError"):
+                raise FeedError(f"{tool}: {text}")
+            return json.loads(text)
+        except (ValueError, KeyError, IndexError, TypeError) as e:   # malformed reply = data error
+            raise FeedError(f"{tool}: unexpected response ({type(e).__name__}: {e}): {raw[:120]!r}") from e
 
     async def call(self, tool: str, args: dict) -> dict:
         return await asyncio.to_thread(self._call_sync, tool, args)
 
     # ---------- typed helpers ----------
+    @_parsed
     async def pair_info(self, label: str) -> PairInfo:
         data = await self.call("spot_market_data_list_pairs", {})
         for p in data.get("pairs", []):
@@ -134,6 +161,7 @@ class McpFeed:
         names = sorted(p["pair"]["label"] for p in data.get("pairs", []))
         raise FeedError(f"pair {label!r} not listed. Some available: {names[:15]}")
 
+    @_parsed
     async def book(self, label: str) -> Book:
         d = (await self.call("spot_market_data_get_book",
                              {"pair": {"label": label}, "level": "FEED_LEVEL_L2"}))["l2"]
@@ -143,6 +171,7 @@ class McpFeed:
         return Book(bids=lv(d.get("bids", [])), asks=lv(d.get("asks", [])),
                     ts=ts, slot=int(md.get("slot", 0)))
 
+    @_parsed
     async def candle_closes(self, label: str, minutes: int = 120) -> list[float]:
         start = int((time.time() - minutes * 60) * 1e6)
         d = await self.call("spot_historical_get_candles", {
@@ -151,6 +180,7 @@ class McpFeed:
         cs = sorted(d.get("candles", []), key=lambda c: int(c["ts"]["micros"]))
         return [float(c["close"]["value"]) for c in cs if "close" in c]
 
+    @_parsed
     async def fills_since(self, label: str, since_ts: float, limit: int = 200) -> list[Fill]:
         args = {"pair": {"label": label}, "limit": limit,
                 "start": {"micros": str(int(since_ts * 1e6))}}

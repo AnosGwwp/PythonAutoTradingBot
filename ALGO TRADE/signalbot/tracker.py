@@ -4,6 +4,10 @@ Management (identical in live tracking and backtests):
   * close an equal slice at each TP (3 TPs -> 1/3 each)
   * after TP1 the stop moves to breakeven; after TP2 it moves to TP1
   * if a candle touches both stop and target, assume the STOP hit first (conservative)
+  * a TP counts only when price trades THROUGH it (a touch may not fill a resting limit order;
+    a trade beyond it means every order at the TP price was filled)
+  * if a candle hits a TP and then CLOSES back beyond the stop it just moved, that stop was
+    certainly hit after the TP (the close is the candle's last price)
 
 update() returns a list of event dicts:
   {"kind": "tp", "n": 1, "price": .., "new_sl": ..}
@@ -34,9 +38,10 @@ def update(sig: Signal, k: Candle, fee_pct: float, max_bars: int, bar_ms: int) -
         _close(sig, "stop loss" if sig.tp_hit == 0 else f"stop after TP{sig.tp_hit}", k.tc, fee_pct)
         return ev
 
+    tp_before = sig.tp_hit
     while sig.tp_hit < n:
         tp = sig.tps[sig.tp_hit]
-        if (k.h >= tp) if d == 1 else (k.l <= tp):
+        if (k.h > tp) if d == 1 else (k.l < tp):
             part = 1.0 / n
             sig.realized_r += part * d * (tp - sig.entry) / risk
             sig.remaining -= part
@@ -49,6 +54,13 @@ def update(sig: Signal, k: Candle, fee_pct: float, max_bars: int, bar_ms: int) -
         sig.remaining = 0.0
         _close(sig, "all targets", k.tc, fee_pct)
         ev.append({"kind": "done"})
+        return ev
+
+    if sig.tp_hit > tp_before and d * (k.c - sig.sl_now) <= 0:     # came back through the moved stop
+        sig.realized_r += sig.remaining * d * (sig.sl_now - sig.entry) / risk
+        sig.remaining = 0.0
+        ev.append({"kind": "stop", "after_tp": sig.tp_hit, "price": sig.sl_now})
+        _close(sig, f"stop after TP{sig.tp_hit}", k.tc, fee_pct)
         return ev
 
     if sig.bars >= max_bars:

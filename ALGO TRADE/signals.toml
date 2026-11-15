@@ -50,7 +50,9 @@ real_money_ok = false      # must be true before env = "mainnet" is allowed to t
 isolated = true            # put the account in isolated margin mode
 trade_watchlist = false    # also auto-trade low-priority (watchlist) pairs?
 max_open_trades = 3        # at most this many bot positions at once
-max_daily_loss_pct = 3     # no NEW trades for the rest of the day after losing this % of capital
+max_same_direction = 2     # at most this many LONGs (or SHORTs) at once: BTC/ETH/SOL usually move together
+max_daily_loss_pct = 3     # no NEW trades for the rest of the day once today's loss (closed trades as
+                           # booked on Bybit + open trades currently losing) reaches this % of capital
 
 [backtest]
 bars = 3000                # entry-timeframe candles of history to test on

@@ -66,8 +66,10 @@ currently set to `env = "demo"`, Bybit Demo Trading: real prices, play money.
 
 1. **Checks.** The trade is skipped, and the alert says why, if:
    - the pair is on the watchlist
-   - 3 bot trades are already open
-   - today's losses have reached `max_daily_loss_pct`
+   - 3 bot trades are already open, or 2 in the same direction (`max_same_direction`: BTC, ETH
+     and SOL usually move together, so a third short is mostly the same bet again)
+   - today's losses have reached `max_daily_loss_pct`. This counts closed trades as Bybit booked
+     them (real fills and fees) plus open bot trades that are currently losing.
    - you already hold that coin
    - price has run past the "don't chase" level
    - the margin is not available
@@ -88,7 +90,8 @@ isolated margin. Don't trade the same coins by hand on that account: the bot clo
 position exists on a coin when its trade ends.
 
 **Leverage.** Each signal shows the position size, the margin at your leverage and an estimated
-liquidation price. Position size comes from `risk_pct`, so leverage changes only the margin
+liquidation price. Position size comes from `risk_pct` of your capital (or of your Bybit equity,
+if that is lower after losses), so leverage changes only the margin
 you lock up, not the dollars you lose at the stop. If the stop would sit too close to
 liquidation, the leverage is lowered for that trade. No single trade uses more than
 `max_margin_pct` of capital as margin. Use **isolated** margin on the exchange.
@@ -129,6 +132,8 @@ Signals below `min_score` are not sent.
   to the stop.
 - **Management:** ⅓ of the position closes at each TP. After TP1 the stop moves to breakeven;
   after TP2 it moves to TP1. A signal that hits nothing within 48 bars expires.
+  A TP counts only once price trades *through* it (a touch may not fill a limit order). If a candle
+  hits a TP and then closes back past the stop it just moved, that stop counts as hit.
 - **Position size:** suggested from `account_size × risk_pct ÷ stop distance`, with leverage
   capped at `max_leverage`.
 
@@ -265,6 +270,10 @@ Live trading needs Flint maker onboarding. Only the Flint team can create a make
 The live executor ([flintbot/live.py](flintbot/live.py)) follows Flint's documented Python SDK.
 The SDK sits behind a private package index, so this code has **not been run against the real
 SDK yet**. Always run `--check` first.
+
+Before going live, also confirm with Flint that `OffsetSpec.price_offset` is **cumulative** (each
+level's distance from the previous level), as this bot assumes. If it is the distance from the
+fair price instead, the deeper levels would sit *inside* level 0.
 
 ### Tuning tips
 

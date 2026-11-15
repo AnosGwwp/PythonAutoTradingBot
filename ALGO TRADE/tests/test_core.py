@@ -34,6 +34,14 @@ class StrategyTests(unittest.TestCase):
         # Our 1.0 at 100.0 is the whole best bid -> next real bid is 99.9.
         self.assertAlmostEqual(microprice(b, {100.0: 1.0}, {}), (99.9 + 100.2) / 2)
 
+    def test_own_quotes_stripped_when_tick_rounded(self):
+        # our computed bid 99.99637... is shown on-chain rounded to 99.996, next to another maker
+        b = Book((Level(99.996, 1.5), Level(99.9, 1.0)), (Level(100.2, 1.0),), 0, 0)
+        m = microprice(b, {99.996372718: 1.0}, {})
+        self.assertAlmostEqual(m, (99.996 * 1.0 + 100.2 * 0.5) / 1.5)   # only OUR 1.0 removed
+        far = microprice(b, {99.95: 1.0}, {})                           # 5 bps away: not ours
+        self.assertAlmostEqual(far, microprice(b))
+
     def test_inventory_skew_and_pull(self):
         c = cfg()
         s = Strategy(c, lot_size=Decimal("0.001"))
@@ -125,6 +133,77 @@ class PaperTests(unittest.TestCase):
         self.ex.on_fills([Fill("s1", 1002.0, self.ask0, 0.04, "buy")])
         self.assertAlmostEqual(self.ex.inventory(), 0.0, places=9)
         self.assertGreater(self.ex.pnl(100.0), 0)
+
+
+class FeedTests(unittest.TestCase):
+    def test_decodes_json_and_event_stream(self):
+        from flintbot.feed import _decode
+        self.assertEqual(_decode(b'{"a": 1}'), {"a": 1})
+        self.assertEqual(_decode(b'event: message\ndata: {"a": 2}\n\n'), {"a": 2})
+
+    def test_malformed_reply_is_a_feed_error(self):
+        from flintbot.feed import FeedError, McpFeed
+        f = McpFeed("https://example.invalid/mcp")
+
+        async def bad_call(tool, args):
+            return {"l2": {"bids": [{"price": {}}]}}             # missing fields
+        f.call = bad_call
+        with self.assertRaises(FeedError):
+            asyncio.run(f.book("SOL/main"))
+
+
+class EngineTests(unittest.TestCase):
+    def run_engine(self, fail_times: int, seconds: float):
+        import tempfile
+        import time as _time
+        from unittest import mock
+
+        from flintbot import engine
+        from flintbot.feed import PairInfo
+        c = cfg()
+        c.tick_sec, c.max_consecutive_errors = 0.01, 3
+        calls = []
+
+        class Feed:
+            def __init__(self, url):
+                pass
+
+            async def pair_info(self, label):
+                return PairInfo(label, "SOL", "USD", 1, 2, "", 0, None, Decimal("0.001"))
+
+            async def candle_closes(self, label):
+                return []
+
+            async def book(self, label):
+                return book(ts=_time.time())
+
+            async def fills_since(self, label, ts):
+                return []
+
+        class Ex(PaperExecutor):
+            async def install(self, *a, **kw):
+                calls.append(1)
+                if len(calls) <= fail_times:
+                    raise RuntimeError("landing timeout")
+                await super().install(*a, **kw)
+
+        with tempfile.TemporaryDirectory() as t:
+            c.journal_dir = t
+            with mock.patch.object(engine, "McpFeed", Feed), mock.patch.object(engine, "PaperExecutor", Ex), \
+                    self.assertLogs("flintbot", "WARNING"):
+                asyncio.run(engine.run(c, duration_sec=seconds))
+            events = [l for p in Path(t).glob("*.jsonl") for l in p.read_text().splitlines()]
+        return calls, events
+
+    def test_transient_submission_error_is_retried(self):
+        calls, events = self.run_engine(fail_times=1, seconds=0.3)
+        self.assertEqual(len(calls), 2)                              # failed once, then installed
+        self.assertFalse(any('"kill"' in e for e in events))
+
+    def test_repeated_submission_errors_kill(self):
+        calls, events = self.run_engine(fail_times=99, seconds=5)
+        self.assertEqual(len(calls), 3)                              # max_consecutive_errors
+        self.assertTrue(any('"kill"' in e for e in events))
 
 
 class RiskTests(unittest.TestCase):

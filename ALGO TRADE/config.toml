@@ -1,0 +1,61 @@
+# Flint automated market-making bot — configuration
+# Run paper mode:  python run.py
+# Run live mode:   python run.py --live   (needs maker_id + quoter key, see README)
+
+[network]
+name = "devnet"
+mcp_url = "https://devnet.mcp.flint.trade/mcp"   # public, read-only market data (no sign-in)
+
+[market]
+pair = "SOL/main"          # pair label exactly as Flint lists it (devnet quote asset is "main")
+
+[loop]
+tick_sec = 1.0             # how often the bot reads the book and decides
+status_every_sec = 15      # console status line cadence
+
+[strategy]
+# Fair price = top-of-book microprice (size-weighted mid).
+min_half_spread_bps = 8.0  # tightest distance from fair to best bid/ask
+max_half_spread_bps = 80.0 # never quote wider than this
+vol_mult = 1.0             # half-spread >= vol_mult * sigma(horizon)
+vol_horizon_sec = 10.0     # horizon used to scale realized volatility
+vol_halflife_sec = 300.0   # EWMA half-life of the volatility estimate (seeded from 1m candles)
+vol_sample_sec = 5.0       # sample spacing for vol (filters book-size noise)
+skew_bps = 15.0            # reservation-price shift at full inventory (inventory skew)
+requote_bps = 2.0          # only send a new fair if a side moved more than this (saves fees)
+heartbeat_sec = 5.0        # ...or if this long has passed (must beat on-chain staleness)
+
+# Ladder (OracleOffset). Offsets are cumulative from fair: level0 at min_half_spread,
+# each next level step_bps further out. Sizes are in BASE units.
+levels = 3
+level_size = "0.05"
+size_growth = 1.5          # each deeper level is 1.5x the previous
+step_bps = 6.0
+staleness_slots = 25       # on-chain: levels stop filling if fair is >25 slots (~10s) old
+reinstall_drift_pct = 3.0  # rebuild the ladder if price drifts this far from install price
+
+[risk]
+max_inventory_base = 0.5   # soft cap; at/over this the bot stops buying (or selling)
+max_drawdown_quote = 5.0   # kill switch: stop and pull quotes if PnL drops this far from peak
+max_book_age_sec = 10.0    # pull quotes if the book snapshot is older than this
+jump_bps = 60.0            # mid jumps more than this in one tick -> pause (adverse selection)
+jump_cooldown_sec = 20.0
+max_consecutive_errors = 8 # stop if the data feed / submission keeps failing
+
+[paper]
+start_base = "0.25"
+start_quote = "20"
+queue_share = 0.5          # share of taker volume we'd capture when our price is at/through the trade
+maker_fee_bps = 0.0
+
+[live]
+# Fill these in only after Flint onboarding (README → "Going live").
+keypair_path = ""          # quoter (hot) key JSON, delegated on the dashboard. NEVER the admin key.
+program_id = "ssuJqL67UPz8vSZf2Rntp8iuSFCe1hy9GFNrdZEoJWs"  # devnet Flint program; verify on dashboard
+data_source = "mcp"        # "mcp" or "sdk" (gRPC via the Flint SDK, lower latency)
+balance_poll_sec = 10.0
+degraded_spread_mult = 1.5 # widen while the SDK has failed over to Solana RPC
+risk_per_slot_decay = "0.99"
+
+[journal]
+dir = "logs"

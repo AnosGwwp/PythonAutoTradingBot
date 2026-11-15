@@ -1,0 +1,11 @@
+# Paper mode needs NOTHING beyond Python 3.11+ (standard library only).
+#
+# Live mode needs the Flint SDK, hosted on Flint's private index. Get the read-only
+# token from the dashboard Developer tab (https://devnet.dash.flint.trade/maker/developer):
+#
+#   python -m venv .venv
+#   .venv\Scripts\activate
+#   pip install --index-url "https://__token__:%PYPI_MAKER_TOKEN%@pypi.xantasoft.com/simple/" --extra-index-url https://pypi.org/simple "flint-api-client[quic]"
+#
+# (solders, grpcio, etc. are pulled in as dependencies of flint-api-client.)
+flint-api-client[quic]

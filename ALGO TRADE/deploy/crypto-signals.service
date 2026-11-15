@@ -1,0 +1,26 @@
+[Unit]
+Description=Crypto signal scanner + Bybit auto-trader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__DIR__
+EnvironmentFile=__DIR__/.env
+Environment=PYTHONUNBUFFERED=1 PYTHONIOENCODING=utf-8
+ExecStart=__PY__ __DIR__/signals.py scan
+# restart after a crash or reboot; exit code 2 = "already running", so don't loop on it
+Restart=always
+RestartSec=30
+RestartPreventExitStatus=2
+TimeoutStopSec=30
+# hardening: the bot can only write inside its own folder
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=__DIR__
+
+[Install]
+WantedBy=multi-user.target

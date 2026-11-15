@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# VPS helper:  ./bot logs | status | restart | stop | start | check | backtest | update
+cd "$(dirname "$0")"
+PY="$(cat .python 2>/dev/null || command -v python3)"
+SERVICE=crypto-signals
+case "${1:-}" in
+  start|stop|restart) sudo systemctl "$1" $SERVICE && echo "$1: ok" ;;
+  status)   systemctl --no-pager status $SERVICE | head -12; echo; "$PY" signals.py status ;;
+  logs)     journalctl -u $SERVICE -f -n 60 --output=cat ;;
+  check)    "$PY" signals.py check ;;
+  backtest) "$PY" signals.py backtest ;;
+  once)     "$PY" signals.py once ;;
+  update)   # after uploading a new crypto-signals.zip next to this folder
+            unzip -o ../crypto-signals.zip -x 'crypto-signals/.env' 'crypto-signals/logs/*' -d .. \
+              && "$PY" -m unittest discover -s tests -q && sudo systemctl restart $SERVICE && echo "updated + restarted" ;;
+  *) echo "usage: ./bot logs | status | restart | stop | start | check | backtest | once | update" ;;
+esac

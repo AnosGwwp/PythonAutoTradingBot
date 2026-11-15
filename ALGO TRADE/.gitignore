@@ -1,0 +1,13 @@
+logs/
+.venv/
+__pycache__/
+*.pyc
+.env
+# never commit keys
+*keypair*.json
+id.json
+dist/
+.python
+
+# Windows-only launchers (the VPS uses systemctl)
+*.bat

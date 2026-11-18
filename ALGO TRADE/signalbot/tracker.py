@@ -9,9 +9,12 @@ Management (identical in live tracking and backtests):
   * if a candle hits a TP and then CLOSES back beyond the stop it just moved, that stop was
     certainly hit after the TP (the close is the candle's last price)
 
+  * optional (rules.breakeven_at_r): stop to entry once price is that many R in profit, before TP1
+
 update() returns a list of event dicts:
   {"kind": "tp", "n": 1, "price": .., "new_sl": ..}
-  {"kind": "stop", "after_tp": 0|1|2.., "price": ..}
+  {"kind": "breakeven", "price": entry, "new_sl": entry, "at_r": ..}     (optional rule above)
+  {"kind": "stop", "after_tp": 0|1|2.., "price": .., "breakeven": bool}
   {"kind": "done"}                     all targets hit
   {"kind": "expired", "price": .., "bars": ..}
 """
@@ -21,7 +24,10 @@ from .data import Candle
 from .strategy import Signal
 
 
-def update(sig: Signal, k: Candle, fee_pct: float, max_bars: int, bar_ms: int) -> list[dict]:
+def update(sig: Signal, k: Candle, fee_pct: float, max_bars: int, bar_ms: int,
+           breakeven_at_r: float | None = None) -> list[dict]:
+    """breakeven_at_r: also move the stop to entry once price has gone this many R in our favour
+    before TP1 (None = only at TP1, the default rule)."""
     if sig.status != "open" or k.t <= sig.last_t:
         return []
     sig.last_t = k.t
@@ -37,11 +43,13 @@ def update(sig: Signal, k: Candle, fee_pct: float, max_bars: int, bar_ms: int) -
     if hit_sl:
         sig.realized_r += sig.remaining * d * (sig.sl_now - sig.entry) / risk
         sig.remaining = 0.0
-        ev.append({"kind": "stop", "after_tp": sig.tp_hit, "price": sig.sl_now})
-        _close(sig, "stop loss" if sig.tp_hit == 0 else f"stop after TP{sig.tp_hit}", k.tc, fee_pct)
+        at_entry = sig.tp_hit == 0 and sig.sl_now == sig.entry
+        ev.append({"kind": "stop", "after_tp": sig.tp_hit, "price": sig.sl_now, "breakeven": at_entry})
+        _close(sig, "stop at breakeven" if at_entry else "stop loss" if sig.tp_hit == 0
+               else f"stop after TP{sig.tp_hit}", k.tc, fee_pct)
         return ev
 
-    tp_before = sig.tp_hit
+    tp_before, sl_before = sig.tp_hit, sig.sl_now
     while sig.tp_hit < n:
         tp = sig.tps[sig.tp_hit]
         if (k.h > tp) if d == 1 else (k.l < tp):
@@ -59,11 +67,17 @@ def update(sig: Signal, k: Candle, fee_pct: float, max_bars: int, bar_ms: int) -
         ev.append({"kind": "done"})
         return ev
 
-    if sig.tp_hit > tp_before and d * (k.c - sig.sl_now) <= 0:     # came back through the moved stop
+    if (breakeven_at_r and sig.tp_hit == 0 and d * (sig.sl_now - sig.entry) < 0
+            and d * ((k.h if d == 1 else k.l) - sig.entry) >= breakeven_at_r * risk):
+        sig.sl_now = sig.entry                                       # early breakeven
+        ev.append({"kind": "breakeven", "price": sig.entry, "new_sl": sig.entry, "at_r": breakeven_at_r})
+
+    if sig.sl_now != sl_before and d * (k.c - sig.sl_now) <= 0:      # came back through the moved stop
         sig.realized_r += sig.remaining * d * (sig.sl_now - sig.entry) / risk
         sig.remaining = 0.0
-        ev.append({"kind": "stop", "after_tp": sig.tp_hit, "price": sig.sl_now})
-        _close(sig, f"stop after TP{sig.tp_hit}", k.tc, fee_pct)
+        at_entry = sig.tp_hit == 0
+        ev.append({"kind": "stop", "after_tp": sig.tp_hit, "price": sig.sl_now, "breakeven": at_entry})
+        _close(sig, "stop at breakeven" if at_entry else f"stop after TP{sig.tp_hit}", k.tc, fee_pct)
         return ev
 
     if sig.bars >= max_bars:

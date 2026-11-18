@@ -61,13 +61,14 @@ class NotifierTest(unittest.TestCase):
 
     def test_headline_importance_and_first_run_quiet(self):
         with tempfile.TemporaryDirectory() as t:
-            h = news.Headlines({"news": {}}, Path(t) / "seen.json")
+            h = news.Headlines({"news": {"ai": False}}, Path(t) / "seen.json")
             now_rss = RSS.replace(b"Sun, 15 Nov 2026 10:00:00 GMT",
                                   time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime()).encode())
             with mock.patch.object(news, "_get", return_value=now_rss):
                 self.assertEqual(h.poll(["BTC", "SOL"]), [])          # first run: just learn what exists
                 self.assertEqual(len(h.recent), 2)                    # BTC+macro and SOL items kept
                 h.next_poll, h.seen = 0, {}
+                h.recent.clear()                                      # forget the stories: they are new again
                 alerts = h.poll(["BTC", "SOL"])
             titles = [a["title"] for a in alerts]
             self.assertIn("Bitcoin plunges after Fed signals rate hike", titles)
@@ -169,9 +170,11 @@ class ScanTest(unittest.TestCase):
     def test_news_block_skips_trade_but_still_alerts(self):
         trader = mock.Mock(active=True)
         trader.sync.return_value = []
-        blocker = mock.Mock()
+        trader.audit_stops.return_value = []
+        blocker = mock.Mock(**{"alignment.return_value": "none", "context.return_value": ""})
         blocker.block_reason.return_value = "high-impact news: USD CPI"
         res, n = self.run_scan(trader, blocker)
+        blocker.block_reason.assert_called_with("BTCUSDT", mock.ANY, "LONG")     # direction-aware
         self.assertEqual(res.new, 1)
         trader.open.assert_not_called()
         self.assertIn("Not auto-traded", n.signals[0][1])
@@ -181,11 +184,14 @@ class ScanTest(unittest.TestCase):
         trader = mock.Mock(active=True)
         trader.open.return_value = "🤖 traded"
         trader.sync.return_value = []
-        clear = mock.Mock()
+        trader.audit_stops.return_value = []
+        clear = mock.Mock(**{"alignment.return_value": "against",
+                             "context.return_value": "📰 News on BTC (12 h): bearish"})
         clear.block_reason.return_value = ""
         res, n = self.run_scan(trader, clear)
         trader.open.assert_called_once()
-        self.assertEqual(n.signals[0][1], "🤖 traded")
+        self.assertEqual(n.signals[0][1], "🤖 traded\n📰 News on BTC (12 h): bearish")   # mood shown
+        self.assertEqual(self.st.open["BTCUSDT"].features["news"], "against")          # journaled
         saved = json.loads((Path(self.tmp.name) / "s.json").read_text())
         self.assertIn("BTCUSDT", saved["open"])
         self.assertEqual(saved["last_eval"]["BTCUSDT"], self.close)

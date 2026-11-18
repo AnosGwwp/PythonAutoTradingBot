@@ -1,13 +1,16 @@
 """Live scanner: evaluates each pair right after every candle close and tracks open signals.
 
 Efficiency:
-  * candles are cached in memory and only new ones are downloaded (CandleCache)
+  * candles are cached in memory and only new ones are downloaded (CandleCache), shared by
+    signal evaluation, trade tracking, the shock guard and /review
   * the loop wakes ~2 s after each candle close, so signals fire immediately, and otherwise
-    every scan_every_sec to follow open trades on 1-minute candles
+    every track_every_sec while trades are open (scan_every_sec when none are)
+  * downloads run without the lock, so phone commands answer while the exchanges respond
 State survives restarts (logs/signals_state.json).
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import logging
@@ -19,10 +22,12 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import html
+
 from . import learn, tracker
-from .data import TF_MS, CandleCache, DataError, candles
-from .news import News
-from .notify import Notifier, coin, format_signal, px, r_usd, sizing, usd
+from .data import TF_MS, CandleCache, DataError, candles, price
+from .news import SEVERITY, News
+from .notify import Notifier, coin, event_text, format_signal, money, plain, px, r_usd, sizing
 from .remote import KEYBOARD, Remote
 from .strategy import Signal, evaluate, prepare, prepare_trend, trend_index
 from .trader import Trader
@@ -41,6 +46,7 @@ class State:
         self.last_eval: dict[str, int] = {}     # pair -> close time of last evaluated candle
         self.cool_until: dict[str, int] = {}    # pair -> ms
         self.meta: dict = {}                    # misc (daily summary date, ...)
+        self._saved: str | None = None          # last content written (to skip identical writes)
         if path.exists():
             d = json.loads(path.read_text(encoding="utf-8"))
             self.open = {k: Signal(**v) for k, v in d.get("open", {}).items()}
@@ -50,16 +56,20 @@ class State:
             self.meta = d.get("meta", {})
 
     def save(self) -> None:
-        """Atomic write. Never raises: a failed save must not stop trading or lose an alert."""
+        """Atomic write, skipped when nothing changed since the last save. Never raises: a failed
+        save must not stop trading or lose an alert."""
         data = json.dumps({
             "open": {k: asdict(v) for k, v in self.open.items()},
             "closed": [asdict(v) for v in self.closed[-500:]],
             "last_eval": self.last_eval, "cool_until": self.cool_until, "meta": self.meta}, indent=1)
+        if data == self._saved:
+            return
         tmp = self.path.with_suffix(".tmp")
         for attempt in range(3):
             try:
                 tmp.write_text(data, encoding="utf-8")
                 tmp.replace(self.path)
+                self._saved = data
                 return
             except OSError as e:          # e.g. Windows: file briefly open in another program
                 if attempt == 2:
@@ -90,92 +100,182 @@ def all_pairs(cfg: dict) -> list[str]:
 
 
 def scan_once(cfg: dict, st: State, notifier: Notifier, force: bool = False, trader: Trader | None = None,
-              news: News | None = None, cache: CandleCache | None = None) -> ScanResult:
+              news: News | None = None, cache: CandleCache | None = None, lock=None) -> ScanResult:
+    """One pass: follow open trades, then evaluate pairs whose candle just closed.
+
+    Downloads happen WITHOUT holding `lock`, so phone commands stay responsive while the
+    exchanges answer. State changes, Bybit orders and the state file happen under the lock."""
+    lock = lock or contextlib.nullcontext()
     res = ScanResult()
     now = int(time.time() * 1000)
     bar_ms = TF_MS[cfg["entry_tf"]]
     r = cfg["rules"]
     src = cfg["data_source"]
+    get = cache.get if cache else candles
 
-    # 1. follow open signals on 1m candles (and mirror each event on the exchange)
-    for pair, sig in list(st.open.items()):
+    with lock:                                   # what needs downloading
+        tracked = [(pair, sig, sig.last_t) for pair, sig in st.open.items()]
+        paused = cfg.get("paused") and not force
+        due = [] if paused else [p for p in all_pairs(cfg) if p not in st.open and st.cool_until.get(p, 0) <= now
+                                 and (force or now >= st.last_eval.get(p, 0) + bar_ms)]
+
+    # ---- downloads, no lock ----
+    fetched: dict[str, list] = {}
+    for pair, _, last_t in tracked:              # 1m candles, shared with the shock guard via the cache
         try:
-            mins = max(5, min(3000, (now - sig.last_t) // 60_000 + 2))
-            ks = candles(pair, "1m", int(mins), src)
+            mins = max(5, min(3000, (now - last_t) // 60_000 + 2))
+            fetched[pair] = get(pair, "1m", int(mins), src)
             res.data_ok += 1
         except DataError as e:
             res.data_err += 1
             log.warning("tracking %s: %s", pair, e)
-            continue
-        for k in ks:
-            for ev in tracker.update(sig, k, cfg["risk"]["fee_pct"], r["max_bars_open"], TF_MS[sig.tf]):
-                note = trader.on_event(sig, ev) if trader else ""
-                notifier.event(sig, ev, note)
-            if sig.status == "closed":
-                st.closed.append(st.open.pop(pair))
-                st.cool_until[pair] = now + r["cooldown_bars"] * bar_ms
-                learn.record(cfg, sig)
-                break
-
-    # 1b. trades you closed yourself in the Bybit app
-    if trader:
-        for sig, price in trader.sync(list(st.open.values())):
-            tracker.close_now(sig, price, now, cfg["risk"]["fee_pct"], "closed on Bybit")
-            st.closed.append(st.open.pop(sig.symbol))
-            learn.record(cfg, sig)
-            st.cool_until[sig.symbol] = now + r["cooldown_bars"] * bar_ms
-            notifier.event(sig, {"kind": "closed", "price": price, "why": "closed on Bybit"})
-
-    # 2. evaluate pairs whose entry candle has closed since we last looked
-    if cfg.get("paused") and not force:
-        st.save()
-        return res
-    watch = [p for p in cfg.get("watch_pairs", []) if p not in cfg["pairs"]]
-    due = [p for p in all_pairs(cfg) if p not in st.open and st.cool_until.get(p, 0) <= now
-           and (force or now >= st.last_eval.get(p, 0) + bar_ms)]
+    evaluated = []
     if due:
         with ThreadPoolExecutor(max_workers=min(8, len(due))) as pool:
-            futs = [pool.submit(_evaluate_pair, p, cfg, cache) for p in due]
-            for f in futs:
+            for f in [pool.submit(_evaluate_pair, p, cfg, cache) for p in due]:
                 try:
-                    pair, sig, last_close = f.result()
+                    evaluated.append(f.result())
+                    res.data_ok += 1
                 except DataError as e:
                     res.data_err += 1
                     log.warning("%s", e)
-                    continue
                 except Exception:
                     log.exception("evaluating a pair failed")
-                    continue
-                res.data_ok += 1
-                if last_close <= st.last_eval.get(pair, 0) and not force:
-                    res.retry_soon = True
-                    continue
-                st.last_eval[pair] = last_close
-                if sig and not force and now - last_close > MAX_SIGNAL_AGE_MS:
-                    log.info("%s: setup on a candle that closed %d min ago (bot was off?), skipped",
-                             pair, (now - last_close) // 60_000)
-                    continue
-                if sig and pair in watch and sig.score < cfg.get("watch_min_score", 75):
-                    sig = None      # low-priority pairs need a stronger setup
-                if not sig:
-                    continue
-                sig.last_t = last_close - 1   # track from the next minute on
-                sig.risk_usd = sizing(sig, cfg)["risk_amt"]
-                block = news.block_reason(pair, now) if news else ""
-                rule = learn.matching_rule(sig, cfg) if not block else None
-                if rule:
-                    block = f"your rule: skip {rule['label']} (losing in the history; /rules)"
-                if block:
-                    note = (f"🤖 Not auto-traded: {block}." if trader and trader.active
-                            else f"⚠️ Careful: {block}. Consider skipping this one.")
-                else:
-                    note = trader.open(sig, list(st.open.values()), st.closed) if trader else ""
-                st.open[pair] = sig
-                st.save()                       # persist the exchange link immediately
-                notifier.signal(sig, note)
-                res.new += 1
-    st.save()
+
+    with lock:
+        # 1. follow open signals on 1m candles (and mirror each event on the exchange)
+        for pair, sig, _ in tracked:
+            if st.open.get(pair) is not sig or pair not in fetched:
+                continue                         # closed from the phone meanwhile, or no data
+            for k in fetched[pair]:
+                for ev in tracker.update(sig, k, cfg["risk"]["fee_pct"], r["max_bars_open"], TF_MS[sig.tf],
+                                         r.get("breakeven_at_r")):
+                    note = trader.on_event(sig, ev) if trader else ""
+                    log_event(sig, event_text(ev) + (f" | {plain(note)}" if note else ""))
+                    notifier.event(sig, ev, note)
+                if sig.status == "closed":
+                    close_trade(cfg, st, sig, now)
+                    break
+
+        # 1b. trades you closed yourself in the Bybit app (also moves stops after TP fills)
+        if trader:
+            for sig, price in trader.sync(list(st.open.values())):
+                tracker.close_now(sig, price, now, cfg["risk"]["fee_pct"], "closed on Bybit")
+                log_event(sig, f"closed on Bybit @ {price:.8g}")
+                close_trade(cfg, st, sig, now)
+                notifier.event(sig, {"kind": "closed", "price": price, "why": "closed on Bybit"})
+            # 1c. is every stop on Bybit where it should be? (repairs missing / looser stops)
+            for sig, msg in trader.audit_stops(list(st.open.values()), trader.last_positions):
+                log_event(sig, plain(msg))
+                notifier.alert(msg)
+            learn.collect_exchange_pnl(cfg, st, trader, now)      # real Bybit P&L for the journal
+
+        # 2. pairs whose entry candle has closed since we last looked
+        watch = [p for p in cfg.get("watch_pairs", []) if p not in cfg["pairs"]]
+        for pair, sig, last_close in evaluated:
+            if pair in st.open:
+                continue
+            if last_close <= st.last_eval.get(pair, 0) and not force:
+                res.retry_soon = True
+                continue
+            st.last_eval[pair] = last_close
+            if sig and not force and now - last_close > MAX_SIGNAL_AGE_MS:
+                log.info("%s: setup on a candle that closed %d min ago (bot was off?), skipped",
+                         pair, (now - last_close) // 60_000)
+                continue
+            if sig and pair in watch and sig.score < cfg.get("watch_min_score", 75):
+                sig = None      # low-priority pairs need a stronger setup
+            if not sig:
+                continue
+            sig.last_t = last_close - 1   # track from the next minute on
+            sig.risk_usd = sizing(sig, cfg)["risk_amt"]
+            sig.features["signal_price"] = sig.entry  # the fill may differ: the journal measures slippage
+            if news:                      # journaled, so /review can learn whether fighting the news pays
+                sig.features["news"] = news.alignment(pair, sig.side, now)
+            block = news.block_reason(pair, now, sig.side) if news else ""
+            rule = learn.matching_rule(sig, cfg) if not block else None
+            if rule:
+                block = f"your rule: skip {rule['label']} (losing in the history; /rules)"
+            if block:
+                note = (f"🤖 Not auto-traded: {block}." if trader and trader.active
+                        else f"⚠️ Careful: {block}. Consider skipping this one.")
+            else:
+                t_order = time.time()
+                note = trader.open(sig, list(st.open.values()), st.closed) if trader else ""
+                if sig.traded:
+                    log.info("%s: traded %.1fs after the candle closed (orders took %.2fs)",
+                             pair, time.time() - last_close / 1000, time.time() - t_order)
+            context = news.context(pair, sig.side, now) if news else ""
+            note = "\n".join(x for x in (note, context) if x)
+            log_event(sig, f"signal {sig.side} @ {sig.features['signal_price']:.8g}"
+                           + (f", filled @ {sig.entry:.8g} on Bybit" if sig.traded else ", alert only")
+                           + (f" ({plain(block)})" if block else ""))
+            st.open[pair] = sig
+            st.save()                       # persist the exchange link immediately
+            notifier.signal(sig, note)
+            res.new += 1
+        st.save()                           # writes only if something changed
     return res
+
+
+def log_event(sig: Signal, text: str) -> None:
+    """Timeline of what happened to a trade, kept with it and in the journal."""
+    sig.events.append(f"{time.strftime('%m-%d %H:%M')} {text}")
+
+
+def close_trade(cfg: dict, st: State, sig: Signal, now: int) -> None:
+    """Move a closed signal from open to closed: cooldown, journal, Bybit P&L look-up."""
+    if st.open.get(sig.symbol) is sig:
+        st.open.pop(sig.symbol)
+    st.closed.append(sig)
+    st.cool_until[sig.symbol] = now + cfg["rules"]["cooldown_bars"] * TF_MS[cfg["entry_tf"]]
+    learn.on_closed(cfg, st, sig)
+
+
+def react_to_news(actions: list[dict], cfg: dict, st: State, trader: Trader | None, notifier: Notifier) -> None:
+    """Carry out what the news guard decided for open trades (call with the lock held):
+    close on major news against the trade; on notable news, stop to entry if in profit; else warn."""
+    now = int(time.time() * 1000)
+    for a in actions:
+        sig = st.open.get(a["pair"])
+        if sig is None or sig.side != a["side"]:
+            continue
+        s, name = a["story"], f"{coin(sig.symbol)} {sig.side}"
+        why = f"\n<i>{html.escape(s['why'])}</i>" if s.get("by") == "ai" and s.get("why") else ""
+        head = f"{html.escape(s['title'])}{why}"
+        try:
+            price_now = (trader.ex.last_price(sig.symbol) if sig.traded and trader and trader.ex
+                         else price(sig.symbol, cfg["data_source"]))
+        except Exception as e:                       # no price: don't act blind, just warn
+            log.warning("news action %s: no price (%s)", sig.symbol, e)
+            price_now, a = None, dict(a, act="warn")
+        if a["act"] == "close":
+            if sig.traded and trader:
+                try:
+                    trader.flatten(sig)
+                except Exception as e:
+                    notifier.alert(f"⚠️ <b>Major bad news for your {name}</b>\n{head}\n"
+                                   f"Bybit refused to close it ({html.escape(str(e))}). Close it in the app.")
+                    continue
+            tracker.close_now(sig, price_now, now, cfg["risk"]["fee_pct"], "closed: major bad news")
+            log_event(sig, f"closed @ {price_now:.8g}: major news against the trade: {s['title'][:80]}")
+            close_trade(cfg, st, sig, now)
+            notifier.event(sig, {"kind": "closed", "price": price_now, "why": "major news against the trade"},
+                           f"📰 {head}" + ("" if sig.traded else "\n👉 Close it on your exchange too."))
+            continue
+        live = tracker.live_r(sig, price_now) if price_now else 0.0
+        if a["act"] == "protect" and live > 0.2 and sig.d * (sig.sl_now - sig.entry) < 0:
+            sig.sl_now = sig.entry
+            note = trader.on_event(sig, {"kind": "breakeven", "new_sl": sig.entry}) if trader else ""
+            log_event(sig, f"stop to entry: notable news against the trade: {s['title'][:80]}")
+            notifier.alert(f"🛡 <b>{name}: stop moved to entry</b> because of news against the trade\n{head}\n"
+                           f"The trade is {live:+.2f}R now; it can no longer turn into a loss."
+                           + (f"\n{note}" if note else "")
+                           + ("" if sig.traded else f"\n👉 Move your stop to {px(sig.entry)} on your exchange."))
+            continue
+        log_event(sig, f"news warning: {s['title'][:80]}")
+        notifier.alert(f"⚠️ <b>News against your {name}</b>  ·  {SEVERITY[s['severity']]}\n{head}\n"
+                       f"The stop-loss stays in place. To exit now: /close {coin(sig.symbol)}")
 
 
 def preview(cfg: dict) -> int:
@@ -200,23 +300,25 @@ def daily_summary(cfg: dict, st: State, trader: Trader | None) -> str:
     day = lambda ms: time.strftime("%Y-%m-%d", time.localtime(ms / 1000))
     new_today = sum(1 for s in list(st.open.values()) + st.closed if day(s.time) == today)
     closed = [s for s in st.closed if s.closed_at and day(s.closed_at) == today]
-    lines = [f"🌙 <b>Daily summary</b>  ·  {time.strftime('%d %b')}", "",
-             f"New signals today: {new_today}"]
+    lines = [f"🌙 <b>Daily summary</b>  ·  {time.strftime('%d %b')}", ""]
     if closed:
         rs = sum(s.realized_r for s in closed)
         dollars = sum(s.realized_r * r_usd(s, cfg) for s in closed)
-        lines.append(f"Closed today: {len(closed)}  ·  {sum(s.realized_r > 0 for s in closed)} won  ·  "
-                     f"<b>{rs:+.2f}R ≈ {usd(dollars)}</b>")
-        lines += [f"   {'✅' if s.realized_r > 0 else '❌'} {coin(s.symbol)} {s.side}  {s.realized_r:+.2f}R  "
-                  f"({s.exit_reason})" for s in closed]
+        lines.append(f"<b>Today {money(dollars)}</b> ({rs:+.2f}R)  ·  {len(closed)} closed, "
+                     f"{sum(s.realized_r > 0.05 for s in closed)} won")
+        for s in closed:
+            verdict, _ = learn.diagnose(learn.to_record(s, "live"))
+            lines.append(f"{'🟢' if s.d == 1 else '🔴'} {coin(s.symbol)} {s.side.lower()}  "
+                         f"<b>{money(s.realized_r * r_usd(s, cfg))}</b>  {verdict}")
     else:
-        lines.append("Closed today: none")
-    lines.append(f"Open now: {', '.join(f'{coin(p)} {s.side}' for p, s in st.open.items()) or 'none'}")
+        lines.append("No trades closed today.")
+    lines.append(f"New signals today: {new_today}  ·  open now: "
+                 f"{', '.join(f'{coin(p)} {s.side.lower()}' for p, s in st.open.items()) or 'none'}")
     if st.closed:
         total = sum(s.realized_r * r_usd(s, cfg) for s in st.closed)
-        wins = sum(s.realized_r > 0 for s in st.closed)
-        lines.append(f"\nAll time: {len(st.closed)} trades  ·  {wins / len(st.closed) * 100:.0f}% won  ·  "
-                     f"{sum(s.realized_r for s in st.closed):+.2f}R ≈ {usd(total)}")
+        wins = sum(s.realized_r > 0.05 for s in st.closed)
+        lines.append(f"\nAll time <b>{money(total)}</b> ({sum(s.realized_r for s in st.closed):+.2f}R)  ·  "
+                     f"{len(st.closed)} trades, {wins} won  ·  /history")
     if trader and trader.ex:
         try:
             w = trader.ex.wallet()
@@ -226,9 +328,9 @@ def daily_summary(cfg: dict, st: State, trader: Trader | None) -> str:
     return "\n".join(lines)
 
 
-def _weekly_review(cfg: dict, notifier: Notifier) -> None:
+def _weekly_review(cfg: dict, notifier: Notifier, cache: CandleCache | None = None) -> None:
     try:
-        notifier.info(learn.review(cfg))
+        notifier.info(learn.review(cfg, cache.get if cache else None))
     except Exception:
         log.exception("weekly review failed")
 
@@ -271,6 +373,9 @@ def run(cfg: dict) -> int:
         pass
     notifier = Notifier(cfg)
     st = State(log_dir / "signals_state.json")
+    added = learn.backfill(cfg, st.closed)          # trades that closed before the journal existed
+    if added:
+        log.info("journal: added %d earlier closed trade(s) from the state file", added)
     cache = CandleCache()
     lock, wake = threading.RLock(), threading.Event()
     trader = Trader(cfg)
@@ -278,7 +383,7 @@ def run(cfg: dict) -> int:
         if not trader.connect():
             log.warning("auto-trading unavailable: %s", trader.error)
     news = News(cfg, log_dir) if cfg.get("news", {}).get("enabled", True) else None
-    remote = Remote(cfg, st, notifier, lock, wake, trader, news)
+    remote = Remote(cfg, st, notifier, lock, wake, trader, news, cache)
     phone = remote.start()
 
     rk = cfg["risk"]
@@ -308,12 +413,14 @@ def run(cfg: dict) -> int:
             with lock:
                 forced, remote.scan_requested = remote.scan_requested, False
                 wake.clear()
-                try:
-                    res = scan_once(cfg, st, notifier, force=forced, trader=trader, news=news, cache=cache)
-                except Exception as e:   # keep the scanner alive on unexpected errors
-                    log.exception("scan failed: %s", e)
-                    res = ScanResult()
-                remote.last_scan = time.time()
+            try:                         # takes the lock itself, only around state changes
+                res = scan_once(cfg, st, notifier, force=forced, trader=trader, news=news, cache=cache, lock=lock)
+            except Exception as e:       # keep the scanner alive on unexpected errors
+                log.exception("scan failed: %s", e)
+                res = ScanResult()
+            remote.last_scan = time.time()
+            if remote.last_scan - t0 > 5:
+                log.info("slow scan: %.1fs", remote.last_scan - t0)
             if forced:
                 remote.scan_done(res.new)
 
@@ -333,8 +440,13 @@ def run(cfg: dict) -> int:
             if news:
                 with lock:
                     pairs = list(dict.fromkeys(all_pairs(cfg) + list(st.open)))
+                    open_sides = {p: s.side for p, s in st.open.items()}
                 try:
-                    news.tick(pairs, lambda p: cache.get(p, "1m", 70, cfg["data_source"]), notifier)
+                    actions = news.tick(pairs, lambda p: cache.get(p, "1m", 70, cfg["data_source"]), notifier, open_sides)
+                    if actions:
+                        with lock:
+                            react_to_news(actions, cfg, st, trader, notifier)
+                            st.save()
                 except Exception:
                     log.exception("news check failed")
 
@@ -357,7 +469,7 @@ def run(cfg: dict) -> int:
                     st.meta["review_day"] = today
                     st.save()
                     snapshot = copy.deepcopy(cfg)
-                threading.Thread(target=_weekly_review, args=(snapshot, notifier),
+                threading.Thread(target=_weekly_review, args=(snapshot, notifier, cache),
                                  name="weekly-review", daemon=True).start()
 
             if t0 - last_beat > 900:
@@ -365,10 +477,12 @@ def run(cfg: dict) -> int:
                 log.info("running%s | open trades: %s", " (PAUSED)" if cfg.get("paused") else "",
                          ", ".join(f"{p} {s.side}" for p, s in st.open.items()) or "none")
 
-            # wake at the next candle close (+2 s), or after scan_every_sec, whichever is first
+            # wake at the next candle close (+2 s), or after the poll interval, whichever is first.
+            # With trades open, poll faster: a TP fill on Bybit then moves the stop within seconds.
             bar_s = TF_MS[cfg["entry_tf"]] / 1000
             next_close = (time.time() // bar_s + 1) * bar_s + 2
-            deadline = min(t0 + cfg["scan_every_sec"], next_close)
+            every = cfg.get("track_every_sec", 15) if st.open else cfg["scan_every_sec"]
+            deadline = min(t0 + every, next_close)
             if res.retry_soon:
                 deadline = min(deadline, time.time() + 5)
             while time.time() < deadline and not wake.wait(1.0):
@@ -378,6 +492,7 @@ def run(cfg: dict) -> int:
                       "Stop-losses already on Bybit stay active.")
         return 0
     finally:
+        notifier.flush(15)                # queued Telegram messages go out before we exit
         instance_lock.close()
 
 

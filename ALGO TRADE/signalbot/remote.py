@@ -13,14 +13,12 @@ import logging
 import re
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from pathlib import Path
 
-from . import learn, tracker
+from . import learn, net, tracker
 from .data import TF_MS, DataError, price
-from .notify import coin, px, r_usd, usd
+from .notify import away, coin, money, px, r_usd, stop_label, trade_progress, usd
 
 log = logging.getLogger("signals")
 
@@ -31,7 +29,9 @@ KEYS = {"pairs": (None, "pairs"), "watch_pairs": (None, "watch_pairs"), "entry_t
         "trend_tf": (None, "trend_tf"), "paused": (None, "paused"), "min_score": ("rules", "min_score"),
         "account_size": ("risk", "account_size"), "risk_pct": ("risk", "risk_pct"),
         "leverage": ("risk", "leverage"), "autotrade": ("trading", "enabled"),
-        "learn_rules": (None, "learn_rules")}
+        "learn_rules": (None, "learn_rules"), "tp_r": ("rules", "tp_r"),
+        "breakeven_at_r": ("rules", "breakeven_at_r"), "setups": ("rules", "setups")}
+REVIEW_SETTINGS = {"min_score", "tp_r", "breakeven_at_r", "setups"}   # what /apply may change
 
 KEYBOARD = {"keyboard": [[{"text": "📊 Status"}, {"text": "📈 Trades"}],
                          [{"text": "💰 Balance"}, {"text": "🔍 Scan now"}],
@@ -49,6 +49,7 @@ COMMAND_MENU = [
     ("news", "Upcoming big events, price shocks, headlines"),
     ("summary", "Today's results"),
     ("review", "Learn from the trade history: what works, what loses"),
+    ("history", "Last closed trades, explained, with Bybit's real P&L"),
     ("rules", "Your approved 'don't auto-trade' rules"),
     ("apply", "Approve a review suggestion, e.g. /apply 1"),
     ("drop", "Remove a rule, e.g. /drop 1"),
@@ -89,8 +90,9 @@ HELP = """🤖 <b>Phone controls</b>
 /close BTC  — close one trade (on Bybit too)
 
 <b>Learning</b>
-🧠 /review  — what works and what keeps losing (also every week)
-/apply 1  — approve suggestion 1 (stops those auto-trades)
+🧠 /review  — your trades explained, history tests, suggestions (also weekly)
+📒 /history  — last closed trades with Bybit's real P&amp;L
+/apply 1  — approve suggestion 1
 /rules  ·  /drop 1  — see / remove your rules
 
 <b>Money</b>
@@ -169,9 +171,10 @@ def _num(args: list[str], kind=float):
 # ---------------------------------------------------------------- command handler
 class Remote:
     def __init__(self, cfg: dict, st, notifier, lock: threading.RLock, wake: threading.Event, trader=None,
-                 news=None):
+                 news=None, cache=None):
         self.cfg, self.st, self.n, self.lock, self.wake = cfg, st, notifier, lock, wake
-        self.trader, self.news = trader, news
+        self.trader, self.news, self.cache = trader, news, cache
+        self._reviewing = threading.Lock()
         self.conflict_warned = 0.0
         self.chat = str(notifier.tg_chat)
         self.started = time.time()
@@ -187,10 +190,10 @@ class Remote:
         return True
 
     def _api(self, method: str, params: dict, timeout: float = 15):
-        data = urllib.parse.urlencode(params).encode()
         url = f"https://api.telegram.org/bot{self.n.tg_token}/{method}"
-        with urllib.request.urlopen(url, data, timeout=timeout) as r:
-            return json.loads(r.read())
+        return json.loads(net.request("POST", url, body=urllib.parse.urlencode(params).encode(),
+                                      headers={"Content-Type": "application/x-www-form-urlencoded"},
+                                      timeout=timeout))
 
     def _loop(self) -> None:
         try:
@@ -206,7 +209,7 @@ class Remote:
             try:
                 res = self._api("getUpdates", {"offset": self.offset, "timeout": 25,
                                                "allowed_updates": '["message"]'}, timeout=40)
-            except urllib.error.HTTPError as e:
+            except net.HTTPStatusError as e:
                 if e.code == 409 and time.time() - self.conflict_warned > 3600:
                     # Telegram allows one reader per bot: another copy of this bot is running
                     self.conflict_warned = time.time()
@@ -258,36 +261,53 @@ class Remote:
 
     cmd_help = cmd_start
 
+    def _now_prices(self, sigs) -> dict[str, float | None]:
+        out = {}
+        for s in sigs:
+            try:
+                out[s.symbol] = price(s.symbol, self.cfg["data_source"])
+            except DataError:
+                out[s.symbol] = None
+        return out
+
     def cmd_status(self, args):
         with self.lock:
             cfg, st = self.cfg, self.st
             rk = cfg["risk"]
             paused = cfg.get("paused", False)
-            opens = [f"{coin(p)} {s.side}" for p, s in st.open.items()]
+            sigs = list(st.open.values())
             closed = list(st.closed)
+        now = self._now_prices(sigs)
         risk_amt = rk["account_size"] * rk["risk_pct"] / 100
-        lines = [
-            "📊 <b>Status</b>",
-            "State: " + ("⏸ <b>PAUSED</b> (open trades still tracked)" if paused else "✅ Scanning"),
-            f"Pairs: {self._names(cfg['pairs'])}"
-            + (f"  ·  👀 {self._names(cfg.get('watch_pairs', []))}" if cfg.get("watch_pairs") else ""),
-            f"Chart: {cfg['entry_tf']} (trend {cfg['trend_tf']})  ·  Min strength {cfg['rules']['min_score']}",
-            f"Capital ${rk['account_size']:,.0f}  ·  Risk {rk['risk_pct']:g}% (${risk_amt:,.0f})  ·  "
-            f"{rk.get('leverage', 1)}x",
-            "",
-            f"Open trades: {len(opens)}" + (f"  ({', '.join(opens)})" if opens else ""),
-        ]
+        lines = [f"📊 <b>Status</b>  ·  " + ("⏸ <b>PAUSED</b> (open trades still managed)" if paused else "✅ scanning"),
+                 "",
+                 f"👀 {self._names(cfg['pairs'])}"
+                 + (f"  ·  watchlist {self._names(cfg.get('watch_pairs', []))}" if cfg.get("watch_pairs") else "")
+                 + f"  ·  {cfg['entry_tf']} chart",
+                 f"💰 ${rk['account_size']:,.0f}  ·  risk <b>${risk_amt:,.0f}</b> per trade ({rk['risk_pct']:g}%)  ·  "
+                 f"{rk.get('leverage', 1)}x  ·  min strength {cfg['rules']['min_score']}",
+                 "", f"<b>Open trades ({len(sigs)})</b>"]
+        for s in sigs:
+            p = now.get(s.symbol)
+            pnl = (f"<b>{money(tracker.live_r(s, p) * r_usd(s, cfg))}</b> ({tracker.live_r(s, p):+.2f}R)"
+                   if p else "price unavailable")
+            lines.append(f"{'🟢' if s.d == 1 else '🔴'} {coin(s.symbol)} {s.side.lower()}  {pnl}  ·  stop {stop_label(s).split(' · ')[0]}"
+                         + ("" if s.traded else "  ·  alert only"))
+        if not sigs:
+            lines.append("none")
+        lines += ["", "<b>Closed trades</b>"]
         if closed:
             rs = [s.realized_r for s in closed]
+            won = sum(r > 0.05 for r in rs)
             dollars = sum(s.realized_r * r_usd(s, cfg) for s in closed)
-            lines.append(f"Results: {len(rs)} closed  ·  {sum(r > 0 for r in rs) / len(rs) * 100:.0f}% winners"
-                         f"  ·  {sum(rs):+.2f}R ≈ {usd(dollars)}")
+            lines.append(f"{len(rs)} closed  ·  {won} won  ·  {len(rs) - won} lost or flat")
+            lines.append(f"Total <b>{money(dollars)}</b> ({sum(rs):+.2f}R)  ·  /history")
         else:
-            lines.append("Results: no closed trades yet")
+            lines.append("none yet")
         if self.trader:
-            lines.append(self.trader.status_line())
+            lines += ["", self.trader.status_line()]
         last = time.strftime("%H:%M", time.localtime(self.last_scan)) if self.last_scan else "-"
-        lines.append(f"\n<i>Last check {last}  ·  running since "
+        lines.append(f"<i>Last check {last}  ·  running since "
                      f"{time.strftime('%d %b %H:%M', time.localtime(self.started))}</i>")
         return "\n".join(lines)
 
@@ -297,26 +317,38 @@ class Remote:
             cfg = self.cfg
         if not sigs:
             return "📈 No open trades right now."
+        now = self._now_prices(sigs)
+        positions = {}
+        if self.trader and self.trader.ex and any(s.traded for s in sigs):
+            try:
+                positions = self.trader.ex.positions()
+            except Exception:
+                positions = {}
         out = ["📈 <b>Open trades</b>"]
         for s in sigs:
-            try:
-                now = price(s.symbol, cfg["data_source"])
-            except DataError:
-                now = None
-            one_r = r_usd(s, cfg)
-            nxt = f"TP{s.tp_hit + 1} {px(s.tps[s.tp_hit])}" if s.tp_hit < len(s.tps) else "-"
+            p = now.get(s.symbol)
             opened = time.strftime("%d %b %H:%M", time.localtime(s.time / 1000))
-            block = [f"\n{'🟢' if s.d == 1 else '🔴'} <b>{coin(s.symbol)} {s.side}</b>  ·  {s.tf}  ·  {opened}"
+            block = [f"\n{'🟢' if s.d == 1 else '🔴'} <b>{coin(s.symbol)} {s.side}</b>  ·  {s.tf}  ·  since {opened}"
                      + ("  ·  🤖 on Bybit" if s.traded else "  ·  alert only")]
-            if now:
-                lr = tracker.live_r(s, now)
-                block.append(f"Entry {px(s.entry)} → now {px(now)} ({(now / s.entry - 1) * 100:+.2f}%)")
-                block.append(f"P&amp;L: <b>{lr:+.2f}R ≈ {usd(lr * one_r)}</b>")
+            if p:
+                lr = tracker.live_r(s, p)
+                block.append(f"P&amp;L <b>{money(lr * r_usd(s, cfg))}</b> ({lr:+.2f}R)  ·  now {px(p)}, entry {px(s.entry)}")
             else:
                 block.append(f"Entry {px(s.entry)}  (price unavailable)")
-            block.append(f"Stop {px(s.sl_now)}  ·  Next {nxt}  ·  {s.tp_hit} TP hit")
-            out += block
-        out.append("\n<i>Exited early? Send /close COIN</i>")
+            stop_txt = f"🛑 Stop {px(s.sl_now, s.entry)} ({stop_label(s)})" + (f"  <i>{away(p, s.sl_now)}</i>" if p else "")
+            bybit_sl = (positions.get(s.symbol) or {}).get("sl")
+            if s.traded and positions:
+                ok = bybit_sl not in (None, "", "0") and abs(float(bybit_sl) - s.sl_now) <= abs(s.sl_now) * 1e-4
+                stop_txt += "  ✅ on Bybit" if ok else f"  ⚠️ Bybit shows {bybit_sl or 'NONE'}"
+            block.append(stop_txt)
+            if s.tp_hit < len(s.tps):
+                block.append(f"🎯 Next TP{s.tp_hit + 1} {px(s.tps[s.tp_hit], s.entry)}"
+                             + (f"  <i>{away(p, s.tps[s.tp_hit])}</i>" if p else "")
+                             + (f"  ·  {s.tp_hit} TP hit, {s.realized_r:+.2f}R banked" if s.tp_hit else ""))
+            if p:
+                block.append(trade_progress(s, p))
+            out += [b for b in block if b]
+        out.append("\n<i>Want out early? /close COIN</i>")
         return "\n".join(out)
 
     def cmd_settings(self, args):
@@ -495,8 +527,9 @@ class Remote:
                             "Close it in the Bybit app. The trade is still tracked here.")
             t = int(time.time() * 1000)
             tracker.close_now(sig, now, t, self.cfg["risk"]["fee_pct"])
+            sig.events.append(f"{time.strftime('%m-%d %H:%M')} closed by you (/close) @ {now:.8g}")
             self.st.closed.append(self.st.open.pop(sym))
-            learn.record(self.cfg, sig)
+            learn.on_closed(self.cfg, self.st, sig)
             self.st.cool_until[sym] = t + self.cfg["rules"]["cooldown_bars"] * TF_MS[self.cfg["entry_tf"]]
             self.st.save()
             self.n._csv("CLOSED", sig, f"closed by you @ {now:.8g}")
@@ -542,10 +575,22 @@ class Remote:
 
     # ---- learning
     def cmd_review(self, args):
-        self.n.reply("🧠 Reviewing the trade history (about 30 seconds)…")
+        """Runs in the background so other commands keep working; the report arrives when done."""
+        if not self._reviewing.acquire(blocking=False):
+            return "🧠 A review is already running. The report will arrive shortly."
         with self.lock:
             snapshot = copy.deepcopy(self.cfg)
-        return learn.review(snapshot)
+
+        def work():
+            try:
+                self.n.reply(learn.review(snapshot, self.cache.get if self.cache else None), keyboard=KEYBOARD)
+            except Exception as e:
+                log.exception("review failed")
+                self.n.reply(f"⚠️ Review failed: {html.escape(str(e))}")
+            finally:
+                self._reviewing.release()
+        threading.Thread(target=work, name="review", daemon=True).start()
+        return "🧠 Reviewing the trade history… the report follows in a few seconds."
 
     def cmd_apply(self, args):
         n = _num(args, int)
@@ -555,6 +600,16 @@ class Remote:
         if n is None or not 1 <= n <= len(sugg):
             return f"Send /apply 1 to {len(sugg)} (the numbers from the last /review)."
         g = sugg[n - 1]
+        if g.get("type") == "setting":
+            if g["param"] not in REVIEW_SETTINGS:
+                return "That suggestion can't be applied from the phone."
+            with self.lock:
+                old = (self.cfg["rules"] if g["param"] in KEYS and KEYS[g["param"]][0] == "rules"
+                       else self.cfg).get(g["param"])
+                save_setting(self.cfg, g["param"], g["value"])
+            return (f"✅ Changed: <b>{html.escape(g['label'])}</b> (was {html.escape(json.dumps(old))}).\n"
+                    f"It applies to new signals. Saved, so it survives restarts. To undo, send /review again "
+                    f"after a while, or delete logs/settings.json to go back to signals.toml.")
         with self.lock:
             rules = list(self.cfg.get("learn_rules", []))
             if any(r["id"] == g["id"] for r in rules):
@@ -566,6 +621,10 @@ class Remote:
         return (f"✅ Rule {len(rules)} added: no more auto-trades for <b>{html.escape(g['label'])}</b>.\n"
                 "You still get those alerts, and they are still tracked, so the review will tell you "
                 "if this condition recovers. /rules to see all, /drop to remove.")
+
+    def cmd_history(self, args):
+        n = _num(args, int) or 10
+        return learn.history_text(self.cfg, max(1, min(n, 20)))
 
     def cmd_rules(self, args):
         with self.lock:

@@ -9,8 +9,13 @@ realistic with free data. This module uses news defensively instead:
   2. Shock guard: detects sudden price moves itself from 1-minute candles. Price is the fastest
      news feed there is. You get an alert within ~1-2 minutes, and new entries on that coin
      pause for a while.
-  3. Headlines: important crypto/macro headlines for your coins, silent and rate-limited.
-  4. Bybit delisting announcements for your coins.
+  3. Headlines, read like a trader would (news_ai.py: Claude, or keyword rules as fallback):
+     which coin, good or bad, how serious, repeated on other sites or new. Then:
+       * MAJOR news blocks new auto-trades AGAINST it on that coin for `block_hours`
+         (market-wide major news: on every coin)
+       * serious news against an OPEN trade sends a loud warning (the bot doesn't close it)
+       * every signal shows the coin's "news mood"; the mood is journaled for /review
+  4. Bybit delisting announcements for your coins (always major).
 """
 from __future__ import annotations
 
@@ -29,6 +34,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .data import Candle
+from .news_ai import SEVERITY, NewsAnalyst, _similar, coin_patterns  # noqa: F401  (coin_patterns re-exported)
 
 log = logging.getLogger("signals")
 
@@ -39,27 +45,45 @@ FEEDS = {"CoinDesk": "https://www.coindesk.com/arc/outboundfeeds/rss/",
          "Decrypt": "https://decrypt.co/feed"}
 BYBIT_DELIST = "https://api.bybit.com/v5/announcements/index?locale=en-US&type=delistings&limit=20"
 
-NAMES = {"BTC": ["bitcoin"], "ETH": ["ethereum", "ether"], "SOL": ["solana"], "XRP": ["ripple"],
-         "DOGE": ["dogecoin"], "BNB": ["bnb chain"], "ADA": ["cardano"], "AVAX": ["avalanche"],
-         "LINK": ["chainlink"], "DOT": ["polkadot"], "LTC": ["litecoin"], "SUI": ["sui network"],
-         "TON": ["toncoin"], "TRX": ["tron"], "PEPE": ["pepe"], "SHIB": ["shiba inu"],
-         "ARB": ["arbitrum"], "OP": ["optimism"], "APT": ["aptos"], "NEAR": ["near protocol"]}
-MACRO = r"\b(fed|fomc|powell|cpi|inflation|interest rates?|rate (cut|hike)s?|payrolls|jobs report|tariffs?|" \
-        r"recession|treasury|sec|etf|sanctions?|war)\b"
-IMPACT = r"\b(hack(ed)?|exploit(ed)?|drain(ed)?|stolen|lawsuit|sues?|charges?|approv(e|es|ed|al)|" \
-         r"reject(s|ed)?|bans?|banned|delist(s|ed|ing)?|halt(s|ed)?|outage|bankrupt(cy)?|insolven(t|cy)|" \
-         r"emergency|crash(es|ed)?|plunges?|plummets?|surges?|soars?|record high|all-time high|" \
-         r"liquidat(ed|ions?)|reserve|blackrock|executive order)\b"
+H = 3_600_000
+FRESH_MS = 12 * H          # older headlines are ignored entirely
+ALERT_FRESH_MS = 2 * H     # only alert on news published in the last 2 hours
+MOOD_HOURS = 12
+DIR_ICON = {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪"}
 
 
-def _get(url: str, timeout: float = 15, limit: int = 3_000_000) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (signalbot/1.0)"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read(limit)
+def _get(url: str, timeout: float = 15, limit: int = 3_000_000, validators: dict | None = None) -> bytes | None:
+    """Download url. With `validators` (a dict kept by the caller) the request is conditional:
+    an unchanged feed answers 304 with no body, and this returns None."""
+    headers = {"User-Agent": "Mozilla/5.0 (signalbot/1.0)"}
+    seen = (validators or {}).get(url, {})
+    if seen.get("etag"):
+        headers["If-None-Match"] = seen["etag"]
+    if seen.get("modified"):
+        headers["If-Modified-Since"] = seen["modified"]
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            if validators is not None:
+                validators[url] = {"etag": r.headers.get("ETag"), "modified": r.headers.get("Last-Modified")}
+            return r.read(limit)
+    except urllib.error.HTTPError as e:
+        if e.code == 304:
+            return None                      # not modified since the last download
+        raise
 
 
 def _fmt(ms: float) -> str:
     return time.strftime("%a %H:%M", time.localtime(ms / 1000))
+
+
+def _ago(ms: float) -> str:
+    m = max(0, int(ms / 60_000))
+    return f"{m} min ago" if m < 60 else f"{m // 60} h ago"
+
+
+def _coin(pair: str) -> str:
+    return pair[:-4] if pair.endswith("USDT") else pair
 
 
 # ---------------------------------------------------------------- 1. economic calendar
@@ -147,17 +171,6 @@ class ShockGuard:
 
 
 # ---------------------------------------------------------------- 3 + 4. headlines
-def coin_patterns(coins: list[str]) -> dict[str, re.Pattern]:
-    out = {}
-    for c in coins:
-        names = "|".join(re.escape(n) for n in NAMES.get(c, []))
-        # ticker must be UPPERCASE as a whole word (so "sol" in normal text doesn't match), optionally
-        # glued to a contract suffix: Bybit delisting notices name the contract ("SOLUSDT Perpetual")
-        out[c] = re.compile(rf"(?<![A-Za-z]){re.escape(c)}(?:USDT|USDC|USD|PERP)?(?![A-Za-z])"
-                            + (rf"|(?i:\b({names})\b)" if names else ""))
-    return out
-
-
 def parse_rss(raw: bytes, source: str) -> list[dict]:
     items = []
     root = ET.fromstring(raw)
@@ -171,17 +184,32 @@ def parse_rss(raw: bytes, source: str) -> list[dict]:
             t = email.utils.parsedate_to_datetime(it.findtext("pubDate") or "").timestamp() * 1000
         except (TypeError, ValueError):
             pass
-        items.append({"title": title, "link": link, "t": t, "source": source})
+        summary = html.unescape(re.sub(r"<[^>]+>", " ", it.findtext("description") or ""))
+        items.append({"title": title, "link": link, "t": t, "source": source,
+                      "summary": " ".join(summary.split())[:300]})
     return items
 
 
+def story_time(s: dict) -> float:
+    """When the story happened: its publish time, else when the bot first saw it."""
+    return s.get("t") or s.get("seen_at") or 0.0
+
+
+def concerns(s: dict, coin: str) -> bool:
+    return s.get("relevant") and (s.get("scope") == "market" or coin in (s.get("coins") or []))
+
+
 class Headlines:
-    def __init__(self, cfg: dict, seen_path: Path):
+    """Fetches the feeds, has each NEW headline assessed (news_ai), keeps the stories."""
+
+    def __init__(self, cfg: dict, seen_path: Path, analyst: NewsAnalyst | None = None):
         n = cfg.get("news", {})
         self.every = n.get("headline_every_sec", 180)
         self.max_per_hour = n.get("headline_max_per_hour", 6)
         self.delist = n.get("bybit_delistings", True)
+        self.analyst = analyst or NewsAnalyst(cfg)
         self.path = seen_path
+        self.stories_path = seen_path.with_name("news_stories.json")
         self.seen: dict[str, float] = {}
         self.first = True
         if seen_path.exists():
@@ -190,15 +218,24 @@ class Headlines:
                 self.first = False
             except ValueError:
                 pass
-        self.recent: deque = deque(maxlen=30)
+        self._validators: dict[str, dict] = {}   # ETag / Last-Modified per feed (conditional GET)
+        self.recent: deque = deque(maxlen=300)   # relevant stories, newest first (kept 48 h)
+        try:
+            cut = time.time() * 1000 - 48 * H
+            stories = json.loads(self.stories_path.read_text(encoding="utf-8"))
+            self.recent.extend(s for s in stories if s.get("seen_at", 0) > cut)
+        except (OSError, ValueError):
+            pass
         self.sent: deque = deque(maxlen=100)
+        self.last_new: list[dict] = []           # stories added by the latest poll
         self.next_poll = 0.0
 
     def _fetch_all(self) -> list[dict]:
         def one(item):
             name, url = item
             try:
-                return parse_rss(_get(url), name)
+                raw = _get(url, validators=self._validators)
+                return [] if raw is None else parse_rss(raw, name)      # None: feed unchanged
             except Exception as e:
                 log.debug("feed %s: %s", name, e)
                 return []
@@ -208,48 +245,56 @@ class Headlines:
             try:
                 d = json.loads(_get(BYBIT_DELIST))
                 for a in d.get("result", {}).get("list", []):
-                    out.append({"title": a.get("title", ""), "link": a.get("url", ""),
+                    out.append({"title": a.get("title", ""), "link": a.get("url", ""), "summary": "",
                                 "t": float(a.get("publishTime") or 0), "source": "Bybit", "delist": True})
             except Exception as e:
                 log.debug("bybit announcements: %s", e)
         return out
 
     def poll(self, coins: list[str]) -> list[dict]:
-        """New important items to alert on (already rate-limited)."""
+        """Fetch, assess new headlines, store the relevant ones. Returns the stories to alert on
+        (rate-limited; major ones always pass). The first run only learns what exists."""
         if time.time() < self.next_poll:
             return []
         self.next_poll = time.time() + self.every
-        pats = coin_patterns(coins)
         now = time.time() * 1000
-        alerts = []
+        new = []
         for it in self._fetch_all():
             key = it["link"] or it["title"]
             if key in self.seen:
                 continue
             self.seen[key] = now
-            hit = [c for c, p in pats.items() if p.search(it["title"])]
-            macro = re.search(MACRO, it["title"], re.I)
-            impact = re.search(IMPACT, it["title"], re.I)
-            if it.get("delist"):
-                important = bool(hit)
-            else:
-                important = bool(impact and (hit or macro)) or bool(macro and hit)
-            if not (hit or macro or it.get("delist") and hit):
-                continue
-            it["coins"] = hit
-            self.recent.appendleft(it)
-            fresh = not it["t"] or now - it["t"] < 2 * 3_600_000
-            if important and fresh and not self.first:
-                alerts.append(it)
+            if it["t"] and now - it["t"] > FRESH_MS:
+                continue                                   # old news
+            new.append(dict(it, key=key))
+        self.last_new, alerts = [], []
+        if new:
+            earlier = [s for s in self.recent if s.get("severity", 0) >= 1]
+            by_key = {s["key"]: s for s in self.recent if s.get("key")}
+            for it, a in zip(new, self.analyst.assess(new, coins, earlier)):
+                if not a.get("dup"):                       # also catch repeats within this poll
+                    a["dup"] = next((s["key"] for s in self.last_new if _similar(it["title"], s["title"])), None)
+                if a.get("dup") in by_key:                 # the same story from another site
+                    by_key[a["dup"]]["sources"] = by_key[a["dup"]].get("sources", 1) + 1
+                    continue
+                if not a.get("relevant"):
+                    continue
+                story = {**it, **a, "sources": 1, "seen_at": now}
+                self.recent.appendleft(story)
+                by_key[story["key"]] = story
+                self.last_new.append(story)
+                if story["severity"] >= 2 and not self.first and (not it["t"] or now - it["t"] < ALERT_FRESH_MS):
+                    alerts.append(story)
+        if self.first:
+            self.last_new = []                             # nothing is "new" on the very first run
         self.first = False
         self._save()
-        # rate limit
         out = []
-        for it in alerts:
-            if sum(1 for t in self.sent if now - t < 3_600_000) >= self.max_per_hour:
-                break
+        for s in sorted(alerts, key=lambda x: -x["severity"]):
+            if s["severity"] < 3 and sum(1 for t in self.sent if now - t < H) >= self.max_per_hour:
+                continue
             self.sent.append(now)
-            out.append(it)
+            out.append(s)
         return out
 
     def _save(self) -> None:
@@ -257,34 +302,89 @@ class Headlines:
         self.seen = {k: v for k, v in self.seen.items() if v > cut}
         try:
             self.path.write_text(json.dumps(self.seen), encoding="utf-8")
+            self.stories_path.write_text(json.dumps(list(self.recent)), encoding="utf-8")
         except OSError as e:
             log.warning("news cache: %s", e)
 
 
-def headline_message(it: dict) -> str:
-    tag = "🚨 <b>Bybit delisting</b>" if it.get("delist") else "📰 <b>News</b>"
-    coins = f"  ·  {', '.join(it['coins'])}" if it.get("coins") else ""
-    link = f'\n<a href="{html.escape(it["link"], quote=True)}">{html.escape(it["source"])}</a>' if it["link"] else ""
-    return f"{tag}{coins}\n{html.escape(it['title'])}{link}"
+def headline_message(s: dict) -> str:
+    sev = s.get("severity", 0)
+    head = "🚨 <b>Bybit delisting</b>" if s.get("delist") else ("🚨" if sev >= 3 else "📰") + " <b>News</b>"
+    who = ", ".join(s.get("coins") or []) or ("whole market" if s.get("scope") == "market" else "")
+    tags = "  ·  ".join(x for x in (who, f"{DIR_ICON.get(s.get('direction'), '')} {s.get('direction', '')}",
+                                    SEVERITY.get(sev, "")) if x.strip())
+    lines = [f"{head}  ·  {html.escape(tags)}", html.escape(s["title"])]
+    if s.get("why") and s.get("by") == "ai":
+        lines.append(f"<i>{html.escape(s['why'])}</i>")
+    src = html.escape(s.get("source", ""))
+    lines.append(f'<a href="{html.escape(s["link"], quote=True)}">{src}</a>' if s.get("link") else src)
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- orchestration
 class News:
-    def __init__(self, cfg: dict, log_dir: Path):
+    def __init__(self, cfg: dict, log_dir: Path, analyst: NewsAnalyst | None = None):
         n = cfg.get("news", {})
         self.cfg = cfg
         self.calendar = Calendar(cfg, log_dir / "calendar.json") if n.get("calendar", True) else None
         self.shock = ShockGuard(cfg) if n.get("shock_guard", True) else None
-        self.headlines = Headlines(cfg, log_dir / "news_seen.json") if n.get("headlines", True) else None
+        self.headlines = (Headlines(cfg, log_dir / "news_seen.json", analyst or NewsAnalyst(cfg))
+                          if n.get("headlines", True) else None)
         self.heads_up = n.get("heads_up_min", 30) * 60_000
+        self.block_ms = n.get("block_hours", 4) * H
+        self.block_sev = n.get("block_min_severity", 3)
+        self.warn_open = n.get("warn_open_trades", True)
         self.warned: set[str] = set()
+        self.warned_open: set[tuple[str, str]] = set()
+        self.coins: list[str] = []
 
     def status_line(self) -> str:
         parts = [name for name, on in (("calendar", self.calendar), ("price shocks", self.shock),
                                        ("headlines", self.headlines)) if on]
-        return "📰 News guard: " + (", ".join(parts) if parts else "off")
+        line = "📰 News guard: " + (", ".join(parts) if parts else "off")
+        if self.headlines:
+            line += f"\n🧠 Headlines read by: {html.escape(self.headlines.analyst.label)}"
+        return line
 
-    def block_reason(self, pair: str, now_ms: float) -> str:
+    # ---- what the stories mean for one coin
+    def stories(self, coin: str, now_ms: float, hours: float) -> list[dict]:
+        if not self.headlines:
+            return []
+        return [s for s in self.headlines.recent if concerns(s, coin) and now_ms - story_time(s) <= hours * H]
+
+    def mood(self, coin: str, now_ms: float) -> tuple[str, float, list[dict]]:
+        """Recent news leaning for a coin: ('bullish'|'bearish'|'mixed'|'quiet', score, stories)."""
+        items = [s for s in self.stories(coin, now_ms, MOOD_HOURS) if s.get("severity", 0) >= 1]
+        score = 0.0
+        for s in items:
+            sign = {"bullish": 1, "bearish": -1}.get(s.get("direction"), 0)
+            weight = {1: 0.5, 2: 1.0, 3: 2.0}.get(s.get("severity"), 0) * (0.5 if s.get("scope") == "market" else 1)
+            score += sign * weight * 0.5 ** ((now_ms - story_time(s)) / (6 * H))
+        if not items:
+            return "quiet", 0.0, []
+        return ("bullish" if score >= 0.75 else "bearish" if score <= -0.75 else "mixed"), score, items
+
+    def alignment(self, pair: str, side: str, now_ms: float) -> str:
+        """'with' / 'against' / 'none': how a new trade sits with the coin's news (for /review)."""
+        m, _, _ = self.mood(_coin(pair), now_ms)
+        if m not in ("bullish", "bearish"):
+            return "none"
+        return "with" if (m == "bullish") == (side == "LONG") else "against"
+
+    def context(self, pair: str, side: str, now_ms: float) -> str:
+        """One line for a signal alert: the coin's news mood, flagged if it leans against the trade."""
+        coin = _coin(pair)
+        m, _, items = self.mood(coin, now_ms)
+        if not items:
+            return ""
+        top = max(items, key=lambda s: (s.get("severity", 0), story_time(s)))
+        line = (f"📰 News on {coin} (12 h): <b>{m}</b>, {len(items)} stor{'y' if len(items) == 1 else 'ies'}. "
+                f"Latest important: {html.escape(top['title'][:90])}")
+        if self.alignment(pair, side, now_ms) == "against":
+            line += "\n⚠️ The news leans against this trade."
+        return line
+
+    def block_reason(self, pair: str, now_ms: float, side: str | None = None) -> str:
         """Why a NEW trade on this pair should wait right now ('' = fine)."""
         if self.calendar:
             e = self.calendar.blackout(now_ms)
@@ -295,11 +395,21 @@ class News:
             s = self.shock.blocked(pair, now_ms)
             if s:
                 return f"price shock {s['pct']:+.1f}% at {_fmt(s['t'])} (paused until {_fmt(s['until'])})"
+        if side:
+            against = "bearish" if side == "LONG" else "bullish"
+            for s in self.stories(_coin(pair), now_ms, self.block_ms / H):
+                if s.get("severity", 0) >= self.block_sev and s.get("direction") == against:
+                    where = _coin(pair) if s.get("scope") == "coin" else "the whole market"
+                    return (f"major {against} news on {where}: {html.escape(s['title'][:90])} "
+                            f"(no new {side.lower()}s until {_fmt(story_time(s) + self.block_ms)})")
         return ""
 
-    def tick(self, pairs: list[str], get_1m, notifier) -> None:
-        """Run once per scanner loop. get_1m(pair) -> recent closed 1m candles."""
+    def tick(self, pairs: list[str], get_1m, notifier, open_sides: dict[str, str] | None = None) -> list[dict]:
+        """Run once per scanner loop. get_1m(pair) -> recent closed 1m candles.
+        open_sides: {pair: "LONG"/"SHORT"} of open trades. Returns what news means for them
+        (see _react_open); the scanner carries it out, since it holds the trades and the exchange."""
         now = time.time() * 1000
+        actions: list[dict] = []
         if self.calendar:
             self.calendar.refresh()
             for e in self.calendar.events:
@@ -313,6 +423,12 @@ class News:
                                   + f"\nBig moves are likely. New auto-trades pause "
                                     f"{self.calendar.before // 60_000} min before until "
                                     f"{self.calendar.after // 60_000} min after.")
+        if self.headlines:
+            self.coins = sorted({_coin(p) for p in pairs})
+            for s in self.headlines.poll(self.coins):
+                (notifier.alert if s["severity"] >= 3 else notifier.info)(headline_message(s))
+            if self.warn_open and open_sides:
+                actions = self._react_open(open_sides)
         if self.shock:
             for p in pairs:
                 try:
@@ -321,19 +437,45 @@ class News:
                     log.debug("shock %s: %s", p, e)
                     continue
                 if s:
-                    coin = p[:-4] if p.endswith("USDT") else p
-                    related = [h for h in (self.headlines.recent if self.headlines else [])
-                               if coin in h.get("coins", []) and now - (h["t"] or now) < 3_600_000][:2]
-                    news = "".join(f"\n• {html.escape(h['title'])}" for h in related)
+                    coin = _coin(p)
+                    related = sorted(self.stories(coin, now, 1), key=lambda x: -x.get("severity", 0))[:2]
+                    news = "".join(f"\n• {DIR_ICON.get(h.get('direction'), '')} {html.escape(h['title'])}"
+                                   for h in related)
                     notifier.alert(f"⚡ <b>{coin} moved {s['pct']:+.1f}% in 5 min</b> (≈{s['x']:.0f}× normal)\n"
-                                   f"Now {s['price']:,.6g}. Possible news."
-                                   + (f"\nRecent headlines:{news}" if news else "")
+                                   f"Now {s['price']:,.6g}. "
+                                   + (f"Likely cause, from the last hour:{news}" if news else
+                                      "No related headline yet: price often moves before the news is out.")
                                    + f"\nNo new {coin} entries until {_fmt(s['until'])}. "
                                      "Open trades keep their stop-loss.")
-        if self.headlines:
-            coins = sorted({p[:-4] if p.endswith("USDT") else p for p in pairs})
-            for it in self.headlines.poll(coins):
-                notifier.info(headline_message(it))
+        return actions
+
+    def _react_open(self, open_sides: dict[str, str]) -> list[dict]:
+        """What new stories mean for OPEN trades. Each story acts once per trade:
+          close   - major news against the trade (market-wide major news only when the AI read it:
+                    keyword rules alone never close every trade at once)
+          protect - notable news against the trade: stop to entry if it is in profit, else warn
+          warn    - when exits are switched off in signals.toml"""
+        n = self.cfg.get("news", {})
+        out = []
+        for s in self.headlines.last_new:
+            if s.get("severity", 0) < 2 or s.get("direction") not in ("bullish", "bearish"):
+                continue
+            if s.get("scope") == "market" and s["severity"] < 3:
+                continue                                   # market-wide: only major news counts
+            for pair, side in open_sides.items():
+                against = "bearish" if side == "LONG" else "bullish"
+                if s["direction"] != against or not concerns(s, _coin(pair)) or (s["key"], pair) in self.warned_open:
+                    continue
+                self.warned_open.add((s["key"], pair))
+                trusted = s.get("scope") == "coin" or s.get("by") == "ai"
+                if s["severity"] >= 3 and trusted and n.get("exit_on_major", True):
+                    act = "close"
+                elif n.get("protect_on_notable", True):
+                    act = "protect"
+                else:
+                    act = "warn"
+                out.append({"pair": pair, "side": side, "story": s, "act": act})
+        return out
 
     def summary(self, now_ms: float) -> str:
         lines = ["📰 <b>News</b>"]
@@ -346,10 +488,30 @@ class News:
             active = [s for p, s in self.shock.info.items() if self.shock.blocked(p, now_ms)]
             if active:
                 lines.append("\n⚡ <b>Paused after price shocks</b>")
-                lines += [f"{s['pair'][:-4]} {s['pct']:+.1f}% until {_fmt(s['until'])}" for s in active]
+                lines += [f"{_coin(s['pair'])} {s['pct']:+.1f}% until {_fmt(s['until'])}" for s in active]
         if self.headlines:
-            lines.append("\n🗞 <b>Latest relevant headlines</b>")
-            latest = sorted(self.headlines.recent, key=lambda x: x["t"], reverse=True)[:6]
-            lines += ([f"• {html.escape(h['title'])} <i>({html.escape(h['source'])})</i>" for h in latest]
-                      or ["none yet (checks every few minutes)"])
+            if self.coins:
+                icon = {"bullish": "🟢", "bearish": "🔴", "mixed": "⚪", "quiet": "💤"}
+                moods = [(c, self.mood(c, now_ms)[0]) for c in self.coins]
+                lines.append("\n🧭 <b>Mood (12 h)</b>   " + "  ·  ".join(f"{c} {icon[m]} {m}" for c, m in moods))
+                for c in self.coins:
+                    for side in ("LONG", "SHORT"):
+                        why = self.block_reason(c + "USDT", now_ms, side)
+                        if why.startswith("major"):
+                            lines.append(f"🚫 No new {c} {side.lower()}s: {why}")
+            lines.append("\n🗞 <b>Top stories (12 h)</b>")
+            top = sorted((s for s in self.headlines.recent
+                          if s.get("severity", 0) >= 1 and now_ms - story_time(s) <= 12 * H),
+                         key=lambda s: (-s.get("severity", 0), -story_time(s)))[:6]
+            for s in top:
+                who = ", ".join(s.get("coins") or []) or "market"
+                more = f" +{s['sources'] - 1} sites" if s.get("sources", 1) > 1 else ""
+                lines.append(f"{DIR_ICON.get(s.get('direction'), '')} <b>{SEVERITY.get(s.get('severity'), '')}</b> · "
+                             f"{who} · {_ago(now_ms - story_time(s))}{more}\n{html.escape(s['title'])}"
+                             + (f"\n<i>{html.escape(s['why'])}</i>" if s.get("by") == "ai" and s.get("why") else ""))
+            if not top:
+                lines.append("nothing important (checks every few minutes)")
+            a = self.headlines.analyst
+            calls, cost = a.cost_today()
+            lines.append(f"\n🧠 Read by {html.escape(a.label)}" + (f"  ·  today {calls} requests ≈ ${cost:.3f}" if calls else ""))
         return "\n".join(lines)

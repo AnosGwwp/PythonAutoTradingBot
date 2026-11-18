@@ -23,6 +23,7 @@ import json
 import logging
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .notify import coin, usd
@@ -62,11 +63,12 @@ DIMS = {   # dimension -> value of a trade record (None = unknown, e.g. trades r
     "stretch": lambda t: _band(_f(t, "stretch_atr"), [1.0, 2.0], ["<1 ATR", "1-2 ATR", "2+ ATR"]),
     "stop": lambda t: _band(_f(t, "stop_atr"), [1.05, 2.45], ["tight", "normal", "wide"]),
     "session": lambda t: _band(_f(t, "hour_utc"), [8, 16], ["Asia", "Europe", "US"]),
+    "news": lambda t: _f(t, "news") if _f(t, "news") in ("with", "against") else None,   # live trades only
 }
 COMBOS = [("setup", "coin"), ("side", "coin"), ("setup", "side")]
 NAMES = {"setup": "{} setups", "side": "{} trades", "coin": "{}", "score": "strength {}",
          "adx": "ADX {}", "volume": "volume {}", "trend": "{} big trend", "stretch": "price {} from EMA20",
-         "stop": "{} stops", "session": "{} session"}
+         "stop": "{} stops", "session": "{} session", "news": "trades {} the news"}
 
 
 def cond_id(cond: dict) -> str:
@@ -92,38 +94,97 @@ def matching_rule(sig: Signal, cfg: dict) -> dict | None:
 
 
 # ---------------------------------------------------------------- journal
+def trade_id(sig: Signal) -> str:
+    return f"{sig.symbol}|{sig.time}"
+
+
 def to_record(sig: Signal, source: str) -> dict:
-    return {"source": source, "symbol": sig.symbol, "side": sig.side, "tf": sig.tf, "time": sig.time,
-            "closed_at": sig.closed_at, "setups": list(sig.setups), "score": sig.score,
+    signal_px = sig.features.get("signal_price")
+    slip = (sig.d * (sig.entry - signal_px) / sig.risk) if signal_px and sig.risk else None   # + = worse fill
+    return {"id": trade_id(sig), "source": source, "symbol": sig.symbol, "side": sig.side, "tf": sig.tf,
+            "time": sig.time, "closed_at": sig.closed_at, "setups": list(sig.setups), "score": sig.score,
             "features": dict(sig.features), "entry": sig.entry, "sl": sig.sl, "tps": list(sig.tps),
             "tp_hit": sig.tp_hit, "realized_r": round(sig.realized_r, 4), "exit_reason": sig.exit_reason,
             "bars": sig.bars, "mfe_r": round(sig.mfe_r, 3), "mae_r": round(sig.mae_r, 3),
-            "traded": sig.traded, "qty": sig.qty, "risk_usd": round(sig.risk_usd, 2)}
+            "traded": sig.traded, "qty": sig.qty, "risk_usd": round(sig.risk_usd, 2),
+            "signal_price": signal_px, "slippage_r": round(slip, 3) if slip is not None else None,
+            "events": list(sig.events)[-30:]}
 
 
-def record(cfg: dict, sig: Signal) -> None:
-    """Append a closed trade to the journal. Never raises: a journal line must not stop trading."""
+def _append(cfg: dict, row: dict) -> None:
     path = Path(cfg["alerts"]["log_dir"]) / JOURNAL
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(to_record(sig, "live")) + "\n")
+            f.write(json.dumps(row) + "\n")
     except OSError as e:
         log.warning("could not write the trade journal: %s", e)
 
 
+def record(cfg: dict, sig: Signal) -> None:
+    """Append a closed trade to the journal. Never raises: a journal line must not stop trading."""
+    _append(cfg, to_record(sig, "live"))
+
+
+def on_closed(cfg: dict, st, sig: Signal) -> None:
+    """Every place that closes a trade calls this: journal it, and for an exchange trade, queue a
+    look-up of what Bybit really booked (its records appear a little after the close)."""
+    record(cfg, sig)
+    if sig.traded:
+        st.meta.setdefault("pnl_pending", []).append(
+            {"id": trade_id(sig), "symbol": sig.symbol, "from": sig.traded_at,
+             "to": sig.closed_at or int(time.time() * 1000), "since": int(time.time() * 1000)})
+
+
+def collect_exchange_pnl(cfg: dict, st, trader, now_ms: int) -> None:
+    """Attach Bybit's realized P&L (real fills, fees included) to journaled trades."""
+    keep = []
+    for p in st.meta.get("pnl_pending", []):
+        if now_ms - p["since"] < 120_000:            # give Bybit two minutes to book it
+            keep.append(p)
+            continue
+        res = trader.realized_pnl(p["symbol"], p["from"], p["to"]) if trader else None
+        if res is not None:
+            _append(cfg, {"type": "exchange_pnl", "id": p["id"], "pnl": round(res[0], 4), "fills": res[1],
+                          "at": now_ms})
+        elif now_ms - p["since"] < 2 * 3_600_000:
+            keep.append(p)                           # try again later
+        else:
+            log.warning("no Bybit P&L found for %s", p["id"])
+    st.meta["pnl_pending"] = keep
+
+
+def backfill(cfg: dict, closed: list[Signal]) -> int:
+    """Journal closed trades that ended before the journal existed (they live in the state file)."""
+    have = {t.get("id") or f"{t.get('symbol')}|{t.get('time')}" for t in load_journal(Path(cfg["alerts"]["log_dir"]))}
+    added = 0
+    for sig in closed:
+        if sig.status == "closed" and trade_id(sig) not in have:
+            _append(cfg, dict(to_record(sig, "live"), backfilled=True))
+            added += 1
+    return added
+
+
 def load_journal(log_dir: Path) -> list[dict]:
-    out = []
+    """Closed trades from the journal, with Bybit's realized P&L attached where it is known."""
+    trades, pnl = [], {}
     try:
         lines = (log_dir / JOURNAL).read_text(encoding="utf-8").splitlines()
     except OSError:
-        return out
+        return trades
     for ln in lines:
         try:
-            out.append(json.loads(ln))
+            row = json.loads(ln)
         except ValueError:
             continue
-    return out
+        if row.get("type") == "exchange_pnl":
+            pnl[row["id"]] = row["pnl"]
+        else:
+            trades.append(row)
+    for t in trades:
+        if t.get("id") in pnl:
+            t["exchange_pnl"] = pnl[t["id"]]
+    return trades
 
 
 # ---------------------------------------------------------------- analysis
@@ -220,39 +281,182 @@ def _line(name: str, s: dict) -> str:
     return f"• {html.escape(name)}: {s['n']} trades · {s['win']:.0f}% won · avg {s['avg']:+.2f}R"
 
 
+# ---------------------------------------------------------------- live trades, explained
+def diagnose(t: dict) -> tuple[str, list[str]]:
+    """Plain-words verdict for one closed trade, plus mistake tags used for the takeaways."""
+    r, why, mfe = t["realized_r"], t.get("exit_reason", ""), t.get("mfe_r", 0) or 0
+    tags: list[str] = []
+    if r > 0.05:
+        text = "✅ hit every target" if why == "all targets" else f"✅ won ({why})"
+    elif why == "stop loss":
+        if mfe >= 0.5:
+            text, tags = f"❌ gave back a profit (was +{mfe:.1f}R first)", ["gave_back"]
+        elif (t.get("bars") or 0) <= 2 and mfe < 0.25:
+            text, tags = "❌ failed straight away", ["fast_fail"]
+        else:
+            text = "❌ stopped out"
+    elif why in ("stop at breakeven",) or why.startswith("stop after TP"):
+        text = f"⚪ {why}"
+    elif why == "expired":
+        text = "⌛ ran out of time"
+    else:
+        text = f"✋ {why}"
+    if _f(t, "news") == "against":
+        text += " · traded against the news"
+        tags.append("against_news")
+    slip = t.get("slippage_r")
+    if slip is not None and slip > 0.15:
+        text += f" · filled {slip:.2f}R worse than the signal"
+        tags.append("slippage")
+    return text, tags
+
+
+def _takeaways(live: list[dict], gap: float | None, whatifs: list[dict]) -> list[str]:
+    losers = [t for t in live if t["realized_r"] <= 0.05]
+    tags = [tag for t in losers for tag in diagnose(t)[1]]
+    out = []
+    if not live:
+        out.append("No live trades closed yet. Until there are some, the history test below is the evidence.")
+    elif len(live) < 5:
+        out.append(f"Only {len(live)} live trade(s) so far: too few to judge the bot on its own trades. "
+                   "The history test below carries the evidence for now.")
+    best = {w["param"]: w for w in whatifs if w.get("robust")}
+    if losers and tags.count("gave_back") >= max(2, len(losers) * 0.4):
+        hint = " The breakeven what-if below passed the history test." if "breakeven_at_r" in best else ""
+        out.append(f"{tags.count('gave_back')} of {len(losers)} losses were in profit first: an earlier move "
+                   f"of the stop to entry would have saved them.{hint}")
+    if losers and tags.count("fast_fail") >= max(2, len(losers) * 0.4):
+        hint = " A stricter strength filter passed the history test below." if "min_score" in best else ""
+        out.append(f"{tags.count('fast_fail')} of {len(losers)} losses failed straight away, which usually "
+                   f"means late entries.{hint}")
+    if tags.count("against_news") >= 2:
+        out.append(f"{tags.count('against_news')} losses were trades against the news mood.")
+    slips = [t["slippage_r"] for t in live if t.get("slippage_r") is not None]
+    if len(slips) >= 3 and sum(slips) / len(slips) > 0.1:
+        out.append(f"Fills are on average {sum(slips) / len(slips):.2f}R worse than the signal price.")
+    if gap is not None and gap <= -0.3:
+        out.append(f"Live trades did {abs(gap):.2f}R per trade worse than the history for the same weeks: "
+                   "look at fills, news and trades closed by hand.")
+    if not out:
+        out.append("Nothing unusual: live trades behave like the history says they should.")
+    return out
+
+
+# ---------------------------------------------------------------- what-if tests on history
+def _variants(cfg: dict) -> list[tuple[str, str, object]]:
+    """(label, settings key, value): alternatives to test against the current rules."""
+    r = cfg["rules"]
+    out = []
+    for v in (60, 65, 70, 75, 80):
+        if v != r.get("min_score"):
+            out.append((f"min strength {v}", "min_score", v))
+    if r.get("breakeven_at_r"):
+        out.append(("breakeven only at TP1", "breakeven_at_r", None))
+    for v in (0.5, 0.75):
+        if v != r.get("breakeven_at_r"):
+            out.append((f"stop to entry at +{v}R", "breakeven_at_r", v))
+    for v in ([0.8, 1.6, 2.4], [1.0, 1.5, 2.0], [1.5, 3.0]):
+        if v != list(r.get("tp_r", [])):
+            out.append(("targets " + " / ".join(f"{x:g}R" for x in v), "tp_r", v))
+    if len(r.get("setups", [])) > 1:
+        for v in r["setups"]:
+            out.append((f"{v} setups only", "setups", [v]))
+    return out
+
+
+def what_if(series: dict, cfg: dict, baseline: list[dict], min_trades: int) -> list[dict]:
+    """Replay the same history with each variant. 'robust' = more total R than now in BOTH the older
+    and the newer half, by a real margin: a change that only helps in one half is luck."""
+    from .backtest import simulate
+    if len(baseline) < min_trades:
+        return []
+    mid = sorted(t["time"] for t in baseline)[len(baseline) // 2]
+    half = lambda ts, newer: sum(t["realized_r"] for t in ts if (t["time"] >= mid) == newer)
+    base_total = sum(t["realized_r"] for t in baseline)
+    out = []
+    for name, key, value in _variants(cfg):
+        c = {**cfg, "rules": {**cfg["rules"], key: value}}
+        trades = [to_record(s, "backtest") for sym, (S, T) in series.items() for s in simulate(sym, S, T, c)]
+        if not trades:
+            continue
+        total = sum(t["realized_r"] for t in trades)
+        gain = total - base_total
+        robust = (len(trades) >= min_trades and gain >= max(3.0, 0.05 * len(baseline))
+                  and half(trades, False) > half(baseline, False) and half(trades, True) > half(baseline, True))
+        out.append({"type": "setting", "label": name, "param": key, "value": value, "n": len(trades),
+                    "avg": total / len(trades), "gain": gain, "robust": robust,
+                    "id": f"set:{key}={json.dumps(value)}"})
+    out.sort(key=lambda w: -w["gain"])
+    return out
+
+
+# ---------------------------------------------------------------- the report
+def _money(x: float) -> str:
+    return f"{'-' if x < 0 else '+'}${abs(x):,.2f}"
+
+
 def build_report(history: list[dict], live: list[dict], rules: list[dict], cfg: dict,
-                 failed: list[str] | None = None) -> tuple[str, list[dict]]:
+                 failed: list[str] | None = None, whatifs: list[dict] | None = None) -> tuple[str, list[dict]]:
     lc = cfg.get("learn", {})
     min_trades = int(lc.get("min_trades", 30))
-    lines = [f"🧠 <b>Review</b>  ·  {time.strftime('%d %b')}", ""]
+    whatifs = whatifs or []
+    live = sorted(live, key=lambda t: t.get("closed_at") or t.get("time") or 0)
+    lines = [f"🧠 <b>Review</b>  ·  {time.strftime('%d %b')}"]
 
-    # 1. the bot's own live record
+    # 1. the bot's own trades
+    lines += ["", "<b>📒 Your trades</b>"]
+    gap = None
     if live:
         s = _stats([t["realized_r"] for t in live])
-        lines.append(f"<b>Your live record</b> ({s['n']} closed): {s['win']:.0f}% won · {s['total']:+.2f}R")
-        traded = [t for t in live if t.get("traded")]
-        if traded:
-            dollars = sum(t["realized_r"] * (t.get("risk_usd") or 0) for t in traded)
-            lines.append(f"Auto-traded: {len(traded)} · {sum(t['realized_r'] for t in traded):+.2f}R ≈ {usd(dollars)}")
+        won = sum(t["realized_r"] > 0.05 for t in live)
+        dollars = sum(t["realized_r"] * (t.get("risk_usd") or 0) for t in live)
+        lines.append(f"{s['n']} closed  ·  {won} won  ·  {s['n'] - won} lost or flat")
+        lines.append(f"Result <b>{_money(dollars)}</b> ({s['total']:+.2f}R, avg {s['avg']:+.2f}R per trade)")
+        booked = [t for t in live if t.get("exchange_pnl") is not None]
+        if booked:
+            est = sum(t["realized_r"] * (t.get("risk_usd") or 0) for t in booked)
+            lines.append(f"Bybit booked {_money(sum(t['exchange_pnl'] for t in booked))} on {len(booked)} "
+                         f"auto-trade(s); the bot's own estimate for them: {_money(est)}")
+        lines.append("")
+        for t in live[-8:]:
+            when = time.strftime("%d %b", time.localtime((t.get("closed_at") or t["time"]) / 1000))
+            verdict, _ = diagnose(t)
+            lines.append(f"{'🟢' if t['side'] == 'LONG' else '🔴'} {coin(t['symbol'])} {t['side'].lower()} · {when} · "
+                         f"<b>{t['realized_r']:+.2f}R</b>\n      {verdict}")
+        recent_bt = [t for t in history if t["time"] >= live[0]["time"]]
+        if len(live) >= 5 and len(recent_bt) >= 3:
+            gap = s["avg"] - sum(t["realized_r"] for t in recent_bt) / len(recent_bt)
+            lines.append(f"\nSame weeks in the history: {len(recent_bt)} trades, avg "
+                         f"{sum(t['realized_r'] for t in recent_bt) / len(recent_bt):+.2f}R (live: {s['avg']:+.2f}R)")
+        by_news = {v: _stats([t["realized_r"] for t in live if _f(t, "news") == v]) for v in ("with", "against")}
+        if sum(x["n"] for x in by_news.values() if x) >= 6:
+            lines.append("With the news: " + "  ·  ".join(
+                f"{lab} {x['n']} trades, avg {x['avg']:+.2f}R"
+                for v, lab in (("with", "with"), ("against", "against")) if (x := by_news[v])))
     else:
-        lines.append("<b>Your live record</b>: nothing closed yet. Every trade from now on is recorded.")
+        lines.append("Nothing closed yet. Every trade from now on is recorded.")
 
-    # 2. the same rules over a long history
+    # 2. what stands out
+    lines += ["", "<b>💡 What stands out</b>"] + [f"• {x}" for x in _takeaways(live, gap, whatifs)]
+
+    # 3. the same rules over a long history, and what-if tests
     pairs = ", ".join(coin(p) for p in dict.fromkeys(cfg["pairs"] + cfg.get("watch_pairs", [])))
     pool = [t for t in history if not _blocked(t, rules)]
-    lines += ["", f"<b>History check</b> (same rules, last {cfg['backtest']['bars']} × {cfg['entry_tf']}, {pairs})"]
+    lines += ["", f"<b>🧪 History test</b>  <i>(same rules, last {cfg['backtest']['bars']} × {cfg['entry_tf']}, {pairs})</i>"]
     if failed:
         lines.append(f"<i>no data for {', '.join(failed)}</i>")
-    s = _stats([t["realized_r"] for t in history])
+    s = _stats([t["realized_r"] for t in pool])
     if not s:
         lines.append("No trades in the history.")
         return "\n".join(lines), []
-    lines.append(f"{s['n']} trades · {s['win']:.0f}% won · avg {s['avg']:+.2f}R · total {s['total']:+.1f}R")
-    if rules:
-        p = _stats([t["realized_r"] for t in pool])
-        if p:
-            lines.append(f"With your {len(rules)} rule(s): {p['n']} trades · avg {p['avg']:+.2f}R · total {p['total']:+.1f}R")
-
+    lines.append(f"Now: {s['n']} trades · {s['win']:.0f}% won · avg {s['avg']:+.2f}R · total {s['total']:+.1f}R")
+    lines += [f"<i>{x}</i>" for x in _management(pool)[:1]]
+    settings = [w for w in whatifs if w["robust"]][:2]
+    for w in whatifs[:4]:
+        mark = "✅" if w in settings else "·"
+        note = "better in both halves" if w["robust"] else ("better, but not in both halves" if w["gain"] > 0
+                                                             else "worse")
+        lines.append(f"{mark} {html.escape(w['label'])}: avg {w['avg']:+.2f}R, {w['gain']:+.1f}R vs now ({note})")
     singles = []
     for cond in _conditions(pool):
         if len(cond) == 1:
@@ -261,48 +465,81 @@ def build_report(history: list[dict], live: list[dict], rules: list[dict], cfg: 
                 singles.append((label(cond), st))
     singles.sort(key=lambda x: x[1]["avg"])
     if len(singles) >= 2:
-        lines += ["", "✅ <b>Best</b>"] + [_line(n, st) for n, st in reversed(singles[-3:])]
-        lines += ["❌ <b>Worst</b>"] + [_line(n, st) for n, st in singles[:3]]
+        lines.append("Best: " + "; ".join(f"{html.escape(n)} {st['avg']:+.2f}R" for n, st in reversed(singles[-2:])))
+        lines.append("Worst: " + "; ".join(f"{html.escape(n)} {st['avg']:+.2f}R" for n, st in singles[:2]))
 
-    # 3. suggestions
-    sugg = find_suggestions(history, live, rules, min_trades)
-    lines += ["", "💡 <b>Suggestions</b>"]
+    # 4. suggestions: skip rules and setting changes, each only with strong evidence
+    sugg = [dict(g, type="skip") for g in find_suggestions(history, live, rules, min_trades)] + settings
+    lines += ["", "<b>✅ Suggestions</b>"]
     if not sugg:
-        lines.append("None. No condition is losing clearly and consistently enough to act on. That is the "
-                     "usual result: acting on weaker evidence would mostly chase bad luck.")
+        lines.append("None this time. Nothing beats the current rules clearly in both halves of the history; "
+                     "changing settings on weaker evidence mostly chases luck.")
     for k, g in enumerate(sugg, 1):
-        live_txt = (f" Your live trades: {g['live_n']}, avg {g['live_avg']:+.2f}R." if g["live_n"] else "")
-        lines.append(f"{k}. Stop auto-trading <b>{html.escape(g['label'])}</b>\n"
-                     f"   {g['n']} trades, {g['win']:.0f}% won, avg {g['avg']:+.2f}R; losing in the older "
-                     f"({g['old_avg']:+.2f}R) and newer ({g['new_avg']:+.2f}R) half.{live_txt}\n"
-                     f"   Would have saved ≈ {g['saved']:.1f}R.  → /apply {k}")
+        if g["type"] == "skip":
+            lines.append(f"{k}. Stop auto-trading <b>{html.escape(g['label'])}</b>: {g['n']} trades, avg "
+                         f"{g['avg']:+.2f}R, losing in both halves. Saves ≈ {g['saved']:.1f}R.  /apply {k}")
+        else:
+            lines.append(f"{k}. Change to <b>{html.escape(g['label'])}</b>: {g['gain']:+.1f}R on the history, "
+                         f"better in both halves.  /apply {k}")
     for d in find_drops(history, rules, min_trades):
         lines.append(f"♻️ Rule {d['index']} (<b>{html.escape(d['label'])}</b>) is no longer losing: "
-                     f"{d['n']} trades, avg {d['avg']:+.2f}R.  → /drop {d['index']}")
+                     f"{d['n']} trades, avg {d['avg']:+.2f}R.  /drop {d['index']}")
 
-    # 4. trade management observations
-    notes = _management(pool + [t for t in live if not _blocked(t, rules)])
-    if notes:
-        lines += ["", "🔍 <b>Trade management</b> <i>(for your judgement, never applied automatically)</i>"]
-        lines += [f"• {n}" for n in notes]
-    lines += ["", f"Active rules: {len(rules)}  ·  /rules"]
+    # 5. how complete the data is
+    if live:
+        booked = sum(t.get("exchange_pnl") is not None for t in live if t.get("traded"))
+        lines += ["", f"<i>Data: {len(live)} trades in the journal ({sum(bool(t.get('traded')) for t in live)} "
+                      f"on Bybit, {booked} with Bybit's P&L, {sum(bool(t.get('backfilled')) for t in live)} "
+                      f"added from older records, {sum(not t.get('features') for t in live)} without indicator data)."
+                      f"  /history</i>"]
+    lines.append(f"<i>Active rules: {len(rules)}  ·  /rules</i>")
     return "\n".join(lines), sugg
 
 
-def review(cfg: dict) -> str:
-    """Run the backtest, analyse, save the numbered suggestions for /apply, return the report."""
-    from .backtest import run_pair       # imported here: backtest is only needed for a review
+def review(cfg: dict, get=None) -> str:
+    """Load history once, replay the current rules and each what-if variant, analyse the journal,
+    save the numbered suggestions for /apply, return the report.
+    `get` fetches candles (the scanner passes its cache, so only new candles are downloaded)."""
+    from .backtest import load_series, simulate     # imported here: only needed for a review
     log_dir = Path(cfg["alerts"]["log_dir"])
-    history, failed = [], []
-    for p in dict.fromkeys(cfg["pairs"] + cfg.get("watch_pairs", [])):
+    pairs = list(dict.fromkeys(cfg["pairs"] + cfg.get("watch_pairs", [])))
+
+    def one(p):
         try:
-            history += [to_record(s, "backtest") for s in run_pair(p, cfg)]
+            return load_series(p, cfg, get)
         except Exception as e:
             log.warning("review: no history for %s: %s", p, e)
-            failed.append(coin(p))
-    text, sugg = build_report(history, load_journal(log_dir), cfg.get("learn_rules", []), cfg, failed)
+            return None
+    with ThreadPoolExecutor(max_workers=min(6, len(pairs))) as pool:      # pairs in parallel
+        loaded = dict(zip(pairs, pool.map(one, pairs)))
+    series = {p: v for p, v in loaded.items() if v is not None}
+    failed = [coin(p) for p, v in loaded.items() if v is None]
+    history = [to_record(s, "backtest") for p, (S, T) in series.items() for s in simulate(p, S, T, cfg)]
+    rules = cfg.get("learn_rules", [])
+    pool_now = [t for t in history if not _blocked(t, rules)]
+    whatifs = what_if(series, cfg, pool_now, int(cfg.get("learn", {}).get("min_trades", 30)))
+    text, sugg = build_report(history, load_journal(log_dir), rules, cfg, failed, whatifs)
     save_suggestions(log_dir, sugg)
     return text
+
+
+def history_text(cfg: dict, n: int = 10) -> str:
+    """/history: the last closed trades, in plain words, with what Bybit booked."""
+    live = sorted(load_journal(Path(cfg["alerts"]["log_dir"])), key=lambda t: t.get("closed_at") or t["time"])
+    if not live:
+        return "📒 No closed trades in the journal yet."
+    lines = [f"📒 <b>Last {min(n, len(live))} trades</b>  <i>(of {len(live)} recorded)</i>"]
+    for t in live[-n:][::-1]:
+        when = time.strftime("%d %b %H:%M", time.localtime((t.get("closed_at") or t["time"]) / 1000))
+        money = t["realized_r"] * (t.get("risk_usd") or 0)
+        bybit = f" · Bybit {_money(t['exchange_pnl'])}" if t.get("exchange_pnl") is not None else ""
+        lines.append(f"\n{'🟢' if t['side'] == 'LONG' else '🔴'} <b>{coin(t['symbol'])} {t['side'].lower()}</b> · {when}"
+                     f"{' · 🤖 Bybit' if t.get('traded') else ' · alert only'}\n"
+                     f"<b>{t['realized_r']:+.2f}R ≈ {_money(money)}</b>{bybit}\n{diagnose(t)[0]}")
+        steps = [e for e in t.get("events", []) if "signal" not in e][-3:]
+        if steps:
+            lines.append("<i>" + html.escape("  →  ".join(e[6:] for e in steps)) + "</i>")
+    return "\n".join(lines)
 
 
 def save_suggestions(log_dir: Path, sugg: list[dict]) -> None:

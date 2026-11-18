@@ -26,6 +26,20 @@ from .strategy import CHASE_ATR, Signal, shift_entry
 log = logging.getLogger("signals")
 
 
+def _price(v) -> float | None:
+    """A Bybit price field ("" / "0" / None mean: not set)."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0 else None
+
+
+def _same_price(a, b, tick: str) -> bool:
+    fa, fb = _price(a), _price(b)
+    return fa is not None and fb is not None and round_tick(fa, tick) == round_tick(fb, tick)
+
+
 class Trader:
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -33,6 +47,9 @@ class Trader:
         self.ex: Bybit | None = None
         self.error = ""
         self.missing: dict[str, int] = {}
+        self._moved: dict[str, int] = {}     # symbol -> TP fills whose stop move is already done
+        self._stop_fix_tried: set[str] = set()
+        self.last_positions: dict = {}       # positions seen by the last sync (for stop audits)
 
     # ---------------------------------------------------------------- setup
     @property
@@ -97,21 +114,22 @@ class Trader:
         if same >= t.get("max_same_direction", 2):
             return (f"🤖 Not auto-traded: {same} {sig.side} trade(s) already open. Coins mostly move "
                     "together, so another one would just double the same bet.")
-        limit = self.cfg["risk"]["account_size"] * t.get("max_daily_loss_pct", 3) / 100
-        lost = self.today_loss(closed, open_sigs)
-        if lost >= limit:
-            return f"🤖 Not auto-traded: today's loss limit (${limit:,.0f}) reached. Resumes tomorrow."
         try:
-            return self._open(sig)
+            positions = self.ex.positions()          # one call serves both checks below
+            limit = self.cfg["risk"]["account_size"] * t.get("max_daily_loss_pct", 3) / 100
+            if self.today_loss(closed, open_sigs, positions) >= limit:
+                return f"🤖 Not auto-traded: today's loss limit (${limit:,.0f}) reached. Resumes tomorrow."
+            return self._open(sig, positions)
         except Exception as e:      # never let an exchange problem kill the scanner or lose the alert
             log.exception("auto-trade %s failed", sig.symbol)
             extra = " A position WAS opened (with stop-loss); the bot manages it." if sig.traded else ""
             return f"⚠️ Auto-trade failed: {html.escape(str(e))}.{extra}"
 
-    def _open(self, sig: Signal) -> str:
+    def _open(self, sig: Signal, positions: dict | None = None) -> str:
         ex, sym, long = self.ex, sig.symbol, sig.d == 1
-        if ex.position(sym):
+        if (positions.get(sym) if positions is not None else ex.position(sym)):
             return f"🤖 Not auto-traded: you already hold a {coin(sym)} position on Bybit."
+        self._moved.pop(sym, None)
         info = ex.instrument(sym)
         now = ex.last_price(sym)
         chase = sig.entry + sig.d * CHASE_ATR * sig.atr
@@ -136,8 +154,9 @@ class Trader:
             return f"🤖 Not auto-traded: needs ${margin:,.0f} margin, only ${avail:,.0f} available."
 
         ex.set_leverage(sym, lev)
+        attached_sl = round_tick(plan.sl, info["tick"])
         try:
-            ex.market(sym, "Buy" if long else "Sell", qty, sl=round_tick(plan.sl, info["tick"]))
+            ex.market(sym, "Buy" if long else "Sell", qty, sl=attached_sl)
         except BybitError as e:
             if e.code != UNCERTAIN:                # rejected by Bybit: nothing was opened
                 raise
@@ -160,10 +179,11 @@ class Trader:
         if capital < self.cfg["risk"]["account_size"]:
             problems.append(f"sized from your Bybit equity ${capital:,.0f}, which is below the "
                             f"${self.cfg['risk']['account_size']:,.0f} capital setting")
-        try:
-            ex.set_sl(sym, round_tick(sig.sl, info["tick"]))
-        except BybitError as e:
-            problems.append(f"stop not re-anchored ({e}); the original stop is active")
+        if round_tick(sig.sl, info["tick"]) != attached_sl:       # filled away from the planned price
+            try:
+                ex.set_sl(sym, round_tick(sig.sl, info["tick"]))
+            except BybitError as e:
+                problems.append(f"stop not re-anchored ({e}); the original stop is active")
         placed = self._place_tps(sig, info, problems)
         msg = (f"🤖 <b>Auto-traded on {self.label}</b>\n"
                f"      {'Bought' if long else 'Sold'} {pos['size']:g} {coin(sym)} @ {px(pos['avg'])}  ·  {lev}x  ·  "
@@ -184,14 +204,11 @@ class Trader:
             problems.append("position too small to split; one take-profit at TP1 for all of it")
         else:
             slices = [(tp, part) for tp in sig.tps[:-1]] + [(sig.tps[-1], total - part * (n - 1))]
-        placed = 0
-        for tp, q in slices:
-            try:
-                ex.limit(sym, side, q, round_tick(tp, info["tick"]))
-                placed += 1
-            except BybitError as e:
-                problems.append(f"TP {px(tp)} not placed ({e})")
-        return placed
+        errors = ex.limit_batch(sym, side, [(q, round_tick(tp, info["tick"])) for tp, q in slices])
+        for (tp, _), err in zip(slices, errors):
+            if err:
+                problems.append(f"TP {px(tp)} not placed ({err})")
+        return sum(e is None for e in errors)
 
     # ---------------------------------------------------------------- follow the tracker
     def on_event(self, sig: Signal, ev: dict) -> str:
@@ -200,7 +217,7 @@ class Trader:
             return ""
         sym = sig.symbol
         try:
-            if ev["kind"] == "tp":
+            if ev["kind"] in ("tp", "breakeven"):
                 if not self.ex.position(sym):
                     return ""
                 try:
@@ -211,7 +228,7 @@ class Trader:
                         self.flatten(sig)
                         return "🤖 Price was already back at the new stop, so the rest was closed at market."
                     raise
-                return ""
+                return self.confirm_stop(sig, ev["new_sl"])
             if ev["kind"] in ("stop", "done", "expired"):
                 self.flatten(sig)
             return ""
@@ -242,8 +259,11 @@ class Trader:
         except BybitError as e:
             log.warning("bybit sync: %s", e)
             return []
+        self.last_positions = pos
         now, gone = int(time.time() * 1000), []
         for s in traded:
+            if s.symbol in pos:
+                self._early_stop(s, pos[s.symbol])
             if s.symbol in pos or now - s.traded_at < 60_000:
                 self.missing.pop(s.symbol, None)
                 continue
@@ -256,6 +276,88 @@ class Trader:
                 except BybitError as e:
                     log.warning("bybit sync %s: %s", s.symbol, e)
         return gone
+
+    # ---------------------------------------------------------------- stop checks
+    def desired_stop(self, sig: Signal) -> float:
+        """Where the stop should be: the tracker's stop, or tighter if Bybit already shows TP fills."""
+        k = self._moved.get(sig.symbol, 0)
+        if k <= sig.tp_hit:
+            return sig.sl_now
+        early = sig.entry if k == 1 else sig.tps[k - 2]
+        return early if sig.d * (early - sig.sl_now) > 0 else sig.sl_now
+
+    def confirm_stop(self, sig: Signal, want: float) -> str:
+        """Read the stop back from Bybit. Returns a short note for the alert."""
+        try:
+            p = self.ex.positions().get(sig.symbol)
+            tick = self.ex.instrument(sig.symbol)["tick"]
+        except BybitError as e:
+            return f"⚠️ Couldn't read the stop back from Bybit ({html.escape(str(e))})."
+        if not p:
+            return ""
+        if _same_price(p.get("sl"), want, tick):
+            return f"✅ Bybit confirms the stop at {px(want)}."
+        return f"⚠️ Bybit shows the stop at {p.get('sl') or 'NONE'}, not {px(want)}. The bot retries on its next check."
+
+    def audit_stops(self, open_sigs: list[Signal], positions: dict) -> list[tuple[Signal, str]]:
+        """Each poll: is the stop on Bybit where it should be? Missing or looser stops are put back.
+        A stop you moved CLOSER yourself is left alone. Returns (trade, message) for each repair."""
+        out = []
+        for s in open_sigs:
+            p = positions.get(s.symbol)
+            if not s.traded or not p:
+                continue
+            want = self.desired_stop(s)
+            tick = self.ex.instrument(s.symbol)["tick"]
+            have = _price(p.get("sl"))
+            if have is not None and (_same_price(have, want, tick) or s.d * (have - want) > 0):
+                self._stop_fix_tried.discard(s.symbol)
+                continue                                    # right, or tighter than needed
+            if s.symbol in self._stop_fix_tried:
+                continue                                    # already tried and reported once
+            self._stop_fix_tried.add(s.symbol)
+            try:
+                self.ex.set_sl(s.symbol, round_tick(want, tick))
+                out.append((s, f"🔧 <b>{coin(s.symbol)} stop repaired on Bybit</b>: it was "
+                               f"{'missing' if have is None else px(have)}, now {px(want)}."))
+            except BybitError as e:
+                out.append((s, f"⚠️ <b>{coin(s.symbol)}: the stop on Bybit is "
+                               f"{'missing' if have is None else px(have)}, should be {px(want)}</b>, and Bybit "
+                               f"refused the fix ({html.escape(str(e))}). Check it in the app."))
+        return out
+
+    def realized_pnl(self, symbol: str, start_ms: int, end_ms: int) -> tuple[float, int] | None:
+        """What Bybit booked for one trade: (net P&L in USDT incl. fees, number of closing fills)."""
+        if self.ex is None:
+            return None
+        try:
+            rows = self.ex.closed_pnl(symbol, start_ms=max(0, start_ms - 1000), limit=50)
+        except BybitError as e:
+            log.warning("bybit closed P&L %s: %s", symbol, e)
+            return None
+        mine = [r for r in rows if int(r.get("createdTime") or r.get("updatedTime") or 0) <= end_ms + 600_000]
+        if not mine:
+            return None
+        return sum(float(r.get("closedPnl") or 0) for r in mine), len(mine)
+
+    def _early_stop(self, sig: Signal, p: dict) -> None:
+        """A take-profit order filled on Bybit before the tracker saw it (the tracker works on
+        CLOSED 1-minute candles): move the stop now, not a minute or two later. The tracker still
+        books the TP when its candle closes; its own stop update then finds nothing to change."""
+        n = len(sig.tps)
+        if n < 2 or sig.qty <= 0:
+            return
+        filled = min(int((sig.qty - p["size"]) / (sig.qty / n) + 0.25), n - 1)   # TP slices gone
+        if filled <= max(sig.tp_hit, self._moved.get(sig.symbol, 0)):
+            return
+        new_sl = sig.entry if filled == 1 else sig.tps[filled - 2]
+        try:
+            self.ex.set_sl(sig.symbol, round_tick(new_sl, self.ex.instrument(sig.symbol)["tick"]))
+            self._moved[sig.symbol] = filled
+            p["sl"] = str(new_sl)                    # keep the positions snapshot true for the stop audit
+            log.info("%s: TP%d filled on Bybit, stop moved to %s right away", sig.symbol, filled, px(new_sl))
+        except BybitError as e:
+            log.warning("%s: early stop move failed (%s); the tracker retries at the candle close", sig.symbol, e)
 
     def _exit_price(self, sig: Signal) -> float:
         """Average price of the latest closing fill on Bybit since the trade opened, so a trade you
@@ -280,7 +382,7 @@ class Trader:
             return []
 
     # ---------------------------------------------------------------- reporting
-    def today_loss(self, closed: list[Signal], open_sigs: list[Signal] = ()) -> float:
+    def today_loss(self, closed: list[Signal], open_sigs: list[Signal] = (), positions: dict | None = None) -> float:
         """Today's loss on bot trades in $ (0 if net positive).
 
         Realized P&L comes from Bybit's own records (real fills, fees included) and falls back to
@@ -299,8 +401,8 @@ class Trader:
                 log.warning("bybit closed P&L unavailable, using tracked results: %s", e)
             if open_traded:
                 try:
-                    pos = self.ex.positions()
-                    pnl += sum(min(0.0, pos[s.symbol]["upnl"]) for s in open_traded if s.symbol in pos)
+                    pos = positions if positions is not None else self.ex.positions()
+                    pnl += sum(min(0.0, pos[s.symbol].get("upnl", 0.0)) for s in open_traded if s.symbol in pos)
                 except BybitError as e:
                     log.warning("bybit positions unavailable for the loss limit: %s", e)
         return max(0.0, -pnl)

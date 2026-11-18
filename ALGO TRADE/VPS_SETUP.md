@@ -31,6 +31,16 @@ scp logs\signals_state.json logs\settings.json root@1.2.3.4:~/           (on the
 mkdir -p "logs" && mv ~/signals_state.json ~/settings.json logs/          (on the VPS, in ALGO TRADE)
 ```
 
+## Smarter news with Claude (optional)
+
+1. Create an API key at console.anthropic.com. Haiku 5.5 reading the headlines costs roughly
+   $1 a month.
+2. On the VPS, add it to `.env` with `nano .env`, on a new line: `ANTHROPIC_API_KEY=...`
+3. Run `bash deploy/install.sh` again. It installs the `anthropic` package into `.venv`, points
+   the service at it, and runs the health check. The "News AI" line should say `OK`.
+
+Without a key the bot still works and reads headlines with keyword rules.
+
 ## Option B: install from a zip
 
 ## 1. Build the package (on your PC)

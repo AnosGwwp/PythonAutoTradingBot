@@ -48,6 +48,12 @@ class FakeEx:
     def limit(self, sym, side, qty, price, reduce=True):
         self.orders.append(("limit", side, qty, price))
 
+    def limit_batch(self, sym, side, orders):
+        self.batches = getattr(self, "batches", 0) + 1
+        for qty, price in orders:
+            self.limit(sym, side, qty, price)
+        return [None] * len(orders)
+
     def set_sl(self, sym, sl):
         self.sl = sl
 
@@ -194,18 +200,69 @@ class TraderTest(unittest.TestCase):
         self.assertEqual(len(t.sync([s])), 1)                # 2nd miss: closed on Bybit
 
     def test_bybit_5xx_is_uncertain_4xx_is_rejected(self):
-        import io
-        import urllib.error
         from unittest import mock
 
+        from signalbot import net
         from signalbot.bybit import UNCERTAIN, Bybit, BybitError
         ex = Bybit("k", "s", "demo")
-        for status, want in ((502, UNCERTAIN), (403, 403)):
-            err = urllib.error.HTTPError("u", status, "x", {}, io.BytesIO(b"oops"))
-            with mock.patch("urllib.request.urlopen", side_effect=err):
+        for err, want in ((net.HTTPStatusError(502, b"oops"), UNCERTAIN), (net.HTTPStatusError(403, b"no"), 403),
+                          (ConnectionResetError("reset"), UNCERTAIN), (TimeoutError("slow"), UNCERTAIN)):
+            with mock.patch.object(net, "request", side_effect=err):
                 with self.assertRaises(BybitError) as cm:
                     ex.post("/v5/order/create", {})
             self.assertEqual(cm.exception.code, want)
+
+    def test_take_profits_go_in_one_batch(self):
+        t = self.make()
+        t.open(sig(), [], [])
+        self.assertEqual(t.ex.batches, 1)
+
+    def test_batch_reports_per_order_errors_and_falls_back(self):
+        import json as _json
+        from unittest import mock
+
+        from signalbot import net
+        from signalbot.bybit import Bybit
+        ex = Bybit("k", "s", "demo")
+        reply = {"retCode": 0, "result": {}, "retExtInfo": {"list": [{"code": 0}, {"code": 110017, "msg": "bad"},
+                                                                       {"code": 110072, "msg": "dup"}]}}
+        with mock.patch.object(net, "request", return_value=_json.dumps(reply).encode()):
+            errs = ex.limit_batch("BTCUSDT", "Sell", [(Decimal("1"), Decimal("100"))] * 3)
+        self.assertEqual([e is None for e in errs], [True, False, True])     # duplicate = already placed
+        calls = []
+
+        def fake(method, url, body=None, headers=None, timeout=15):
+            calls.append((url.rsplit("/", 1)[-1], _json.loads(body)))
+            if url.endswith("create-batch"):
+                return b'{"retCode": 10001, "retMsg": "batch not supported"}'
+            return b'{"retCode": 0, "result": {"orderId": "x"}}'
+        with mock.patch.object(net, "request", side_effect=fake):
+            errs = ex.limit_batch("BTCUSDT", "Sell", [(Decimal("1"), Decimal("100"))] * 2)
+        self.assertEqual(errs, [None, None])
+        batch_ids = [r["orderLinkId"] for r in calls[0][1]["request"]]
+        self.assertEqual([c[1]["orderLinkId"] for c in calls[1:]], batch_ids)  # same ids: no double orders
+
+    def test_stop_moves_as_soon_as_bybit_shows_a_tp_fill(self):
+        t = self.make()
+        s = sig()
+        t.open(s, [], [])                                    # 20 coins, TPs of 6.666 each
+        t.ex.sl = None
+        t.ex.pos["BTCUSDT"]["size"] = 13.334                 # TP1 filled on Bybit
+        t.sync([s])
+        self.assertEqual(t.ex.sl, Decimal("100.00"))         # stop to entry before the tracker noticed
+        t.ex.sl = None
+        t.sync([s])
+        self.assertIsNone(t.ex.sl)                           # done once, not every poll
+        t.ex.pos["BTCUSDT"]["size"] = 6.668                  # TP2 filled
+        t.sync([s])
+        self.assertEqual(t.ex.sl, round_tick(s.tps[0], "0.01"))
+
+    def test_stop_not_resent_when_fill_matches_plan(self):
+        t = self.make()
+        calls = []
+        t.ex.set_sl = lambda sym, sl: calls.append(sl)
+        t.open(sig(), [], [])
+        self.assertEqual(calls, [])                          # filled at the planned price: stop already right
 
     def test_rounding(self):
         self.assertEqual(floor_step(0.02149, "0.001"), Decimal("0.021"))

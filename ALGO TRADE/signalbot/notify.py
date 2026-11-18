@@ -7,23 +7,28 @@ import json
 import logging
 import math
 import os
+import queue
 import re
+import threading
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from . import net
 from .strategy import CHASE_ATR, Signal
 
 log = logging.getLogger("signals")
 
 
 # ---------------------------------------------------------------- helpers
-def px(p: float) -> str:
-    if p <= 0:
+def px(p: float, ref: float | None = None) -> str:
+    """Price with sensible decimals. `ref` (e.g. the entry) makes every level of one trade use the
+    same number of decimals, so they line up."""
+    base = ref if ref and ref > 0 else p
+    if base <= 0:
         return f"{p}"
-    dec = min(8, max(2, 4 - int(math.floor(math.log10(p)))))
+    dec = min(8, max(2, 4 - int(math.floor(math.log10(base)))))
     return f"{p:,.{dec}f}"
 
 
@@ -129,6 +134,41 @@ def plain(text: str) -> str:
 
 
 # ---------------------------------------------------------------- messages (HTML)
+def money(x: float) -> str:
+    """-$7.01 / +$12.50: always signed, so a loss can't be misread as a gain."""
+    return f"{'-' if x < 0 else '+'}${abs(x):,.2f}"
+
+
+def away(now: float, level: float) -> str:
+    """How far a level is from the current price, e.g. '2.1% away'."""
+    return f"{abs(level / now - 1) * 100:.1f}% away" if now else ""
+
+
+def bar(frac: float, width: int = 10) -> str:
+    """Progress bar from stop (0) to the next target (1): where price is between the two."""
+    n = max(0, min(width, round(frac * width)))
+    return "▓" * n + "░" * (width - n)
+
+
+def trade_progress(sig: Signal, now: float) -> str:
+    """'🛑 1,796.11 ▓▓▓░░░░░░░ 1,698.53 🎯' with the current stop and the next target."""
+    if sig.tp_hit >= len(sig.tps) or not now:
+        return ""
+    tgt, stop = sig.tps[sig.tp_hit], sig.sl_now
+    span = (tgt - stop) * sig.d
+    frac = ((now - stop) * sig.d / span) if span else 0.0
+    return f"<code>🛑 {px(stop, sig.entry)} {bar(frac)} {px(tgt, sig.entry)} 🎯</code>"
+
+
+def stop_label(sig: Signal) -> str:
+    """Where the stop is, in words."""
+    if sig.tp_hit >= 2:
+        return f"at TP{sig.tp_hit - 1} · profit locked"
+    if sig.d * (sig.sl_now - sig.entry) >= 0:
+        return "at entry · can't lose"
+    return "not moved yet"
+
+
 def signal_message(sig: Signal, cfg: dict, note: str = "") -> str:
     s = sizing(sig, cfg)
     if sig.traded:      # show what was really done on the exchange
@@ -139,44 +179,35 @@ def signal_message(sig: Signal, cfg: dict, note: str = "") -> str:
     pct = lambda p: f"{(p / sig.entry - 1) * 100:+.1f}%"
     chase = sig.entry + sig.d * CHASE_ATR * sig.atr
     when = time.strftime("%H:%M", time.localtime(sig.time / 1000))
-    head = f"{'🟢' if long else '🔴'} <b>{'LONG' if long else 'SHORT'}  {coin(sig.symbol)}</b>  ·  {sig.tf} chart"
+    stars = max(1, min(5, round(sig.score / 20)))
+    head = (f"{'🟢' if long else '🔴'} <b>{'LONG' if long else 'SHORT'} {coin(sig.symbol)}</b>  ·  {sig.tf}"
+            f"  ·  {'★' * stars}{'☆' * (5 - stars)} {sig.score}")
     if is_watch(sig, cfg):
         head += "  ·  👀 watchlist"
-    lines = [head, f"Strength: {strength(sig.score)}"]
+    lines = [head]
     if note:
         lines += ["", note]
-    lines += ["", f"▶️ <b>Entry:</b>  {px(sig.entry)}" + ("  <i>(filled)</i>" if sig.traded else "")]
-    if not sig.traded:
-        lines.append(f"      <i>don't {'buy above' if long else 'sell below'} {px(chase)}</i>")
-    lines += [f"🛑 <b>Stop loss:</b>  {px(sig.sl)}  <i>({pct(sig.sl)})</i>", ""]
-    lines += [f"🎯 <b>TP{k + 1}:</b>  {px(tp)}  <i>({pct(tp)})</i>" for k, tp in enumerate(sig.tps)]
-    lines += [
-        "",
-        f"📦 <b>Position:</b>  {s['qty']:.4g} {coin(sig.symbol)}  (≈ ${s['notional']:,.0f})",
-        f"⚙️ <b>Leverage:</b>  {s['lev']}x isolated  ·  Margin ${s['margin']:,.0f}",
-    ]
-    if s["lev"] < s["want"]:
-        lines.append(f"      <i>lowered from {s['want']}x so the stop hits before liquidation</i>")
-    lines.append(f"⚖️ <b>Risk:</b>  ${s['risk_amt']:,.2f}  ({s['risk_pct']:.1f}% of ${s['acct']:,.0f})"
-                 + ("  <i>(reduced: margin limit)</i>" if s["capped"] else ""))
+    rows = [("Entry", px(sig.entry), "filled" if sig.traded else ""), ("Stop", px(sig.sl, sig.entry), pct(sig.sl))]
+    rows += [(f"TP{k + 1}", px(tp, sig.entry), pct(tp)) for k, tp in enumerate(sig.tps)]
+    w = max(len(r[1]) for r in rows)
+    lines += ["", "<pre>" + "\n".join(f"{a:<6}{b:>{w}}  {c}".rstrip() for a, b, c in rows) + "</pre>"]
+    lines.append(f"💰 Risk <b>${s['risk_amt']:,.2f}</b> ({s['risk_pct']:.1f}% of ${s['acct']:,.0f})"
+                 + ("  <i>reduced: margin limit</i>" if s["capped"] else ""))
+    lines.append(f"📦 {s['qty']:.4g} {coin(sig.symbol)} ≈ ${s['notional']:,.0f}  ·  {s['lev']}x isolated  ·  "
+                 f"margin ${s['margin']:,.0f}")
     if s["liq"]:
-        lines.append(f"💀 Liquidation ≈ {px(s['liq'])}  <i>(far past your stop)</i>")
-    lines += [
-        "",
-        "💡 <b>Why</b>",
-    ]
-    lines += [f"• {html.escape(r)}" for r in sig.reasons]
+        lines.append(f"💀 Liquidation ≈ {px(s['liq'])}"
+                     + (f"  <i>(leverage lowered from {s['want']}x to keep it past the stop)</i>"
+                        if s["lev"] < s["want"] else ""))
     n = len(sig.tps)
     if sig.traded:
-        lines += ["", "📋 <i>The bot manages this trade: it moves the stop to entry after TP1 "
-                      "and to TP1 after TP2. Nothing to do.</i>"]
+        lines.append("🤖 <i>The bot manages it: stop to entry after TP1, to TP1 after TP2.</i>")
     else:
-        lines += [
-            "",
-            f"📋 <i>Close 1/{n} at each TP. After TP1, move stop to entry.</i>" if n > 1
-            else "📋 <i>Close all at TP1.</i>",
-            f"🕓 <i>Signal at {when}. Skip it if price already reached TP1.</i>",
-        ]
+        lines.append(f"👉 <i>{'Buy' if long else 'Sell'} now, not {'above' if long else 'below'} {px(chase)}. "
+                     + (f"Close 1/{n} at each TP; after TP1 move the stop to entry." if n > 1 else "Close all at TP1.")
+                     + f" Signal at {when}.</i>")
+    lines.append("<blockquote expandable>💡 Why\n" + "\n".join(f"• {html.escape(r)}" for r in sig.reasons)
+                 + "</blockquote>")
     return "\n".join(lines)
 
 
@@ -187,32 +218,34 @@ def event_message(sig: Signal, ev: dict, cfg: dict, note: str = "") -> str:
 
 def _event_body(sig: Signal, ev: dict, cfg: dict) -> str:
     one_r = r_usd(sig, cfg)
-    name = f"{coin(sig.symbol)} {sig.side}"
-    result = lambda label: f"💵 {label}: <b>{sig.realized_r:+.2f}R  ≈ {usd(sig.realized_r * one_r)}</b>"
+    name = f"{coin(sig.symbol)} {sig.side.lower()}"
+    result = lambda label: f"💵 {label} <b>{money(sig.realized_r * one_r)}</b>  ({sig.realized_r:+.2f}R)"
     k = ev["kind"]
     if k == "tp":
         where = "entry" if ev["n"] == 1 else f"TP{ev['n'] - 1}"
         if sig.traded:
-            cut, stop_txt = (f"✂️ 1/{len(sig.tps)} closed by the take-profit order.",
-                             f"🔒 Stop moved to {where} ({px(ev['new_sl'])}) on Bybit.")
+            todo = f"✂️ 1/{len(sig.tps)} closed by the take-profit order\n🔒 Stop moved to {where} ({px(ev['new_sl'])})"
         else:
-            cut = f"✂️ Close 1/{len(sig.tps)} of the position."
-            stop_txt = (f"🔒 Move stop to entry ({px(ev['new_sl'])}). This trade can't lose now." if ev["n"] == 1
-                        else f"🔒 Move stop to {px(ev['new_sl'])} (TP{ev['n'] - 1}).")
-        return "\n".join([f"🎯 <b>{name}: TP{ev['n']} hit</b> at {px(ev['price'])}", cut, stop_txt,
+            todo = (f"👉 Close 1/{len(sig.tps)} now and move your stop to {where} ({px(ev['new_sl'])})")
+        safe = "  ·  this trade can't lose now" if ev["n"] == 1 else "  ·  profit locked"
+        return "\n".join([f"🎯 <b>{name}: TP{ev['n']} hit</b> at {px(ev['price'])}{safe}", todo,
                           result("Banked so far")])
+    if k == "breakeven":
+        todo = "" if sig.traded else f"\n👉 Move your stop to {px(ev['new_sl'])}."
+        return (f"🛡 <b>{name}: stop moved to entry</b> ({px(ev['new_sl'])}): price reached "
+                f"+{ev.get('at_r', 0):g}R, so the trade can't lose now.{todo}")
     if k == "closed":
-        return "\n".join([f"✋ <b>{name}: {html.escape(ev.get('why', 'closed'))}</b> at ≈ {px(ev['price'])}",
+        return "\n".join([f"✋ <b>{name} closed</b>: {html.escape(ev.get('why', 'closed'))}, at ≈ {px(ev['price'])}",
                           result("Result")])
     if k == "done":
         return "\n".join([f"🏆 <b>{name}: all targets hit!</b>", result("Result")])
     if k == "stop":
-        if ev["after_tp"] == 0:
+        if ev["after_tp"] == 0 and not ev.get("breakeven"):
             title = f"🛑 <b>{name}: stopped out</b> at {px(ev['price'])}"
-        elif ev["after_tp"] == 1:
-            title = f"⚪ <b>{name}: closed at entry</b> (after TP1)"
+        elif ev["after_tp"] <= 1:
+            title = f"⚪ <b>{name}: closed at entry</b>" + (" after TP1" if ev["after_tp"] == 1 else " (no loss)")
         else:
-            title = f"🔒 <b>{name}: trailing stop hit</b> at {px(ev['price'])}"
+            title = f"🔒 <b>{name}: closed at the locked-in stop</b> ({px(ev['price'])}) after TP{ev['after_tp']}"
         return "\n".join([title, result("Result")])
     if k == "expired":
         return "\n".join([f"⌛ <b>{name}: closed after {ev['bars']} candles</b> at {px(ev['price'])}",
@@ -221,14 +254,18 @@ def _event_body(sig: Signal, ev: dict, cfg: dict) -> str:
 
 
 def event_text(ev: dict) -> str:
-    """Short text for the CSV log."""
+    """Short text for the CSV log and the trade's timeline."""
     k = ev["kind"]
     if k == "tp":
         return f"TP{ev['n']} @ {ev['price']:.8g}, stop -> {ev['new_sl']:.8g}"
+    if k == "breakeven":
+        return f"stop -> entry {ev['new_sl']:.8g} (+{ev.get('at_r', 0):g}R reached)"
     if k == "stop":
         return f"stop @ {ev['price']:.8g} (after {ev['after_tp']} TP)"
     if k == "expired":
         return f"expired @ {ev['price']:.8g}"
+    if k == "closed":
+        return f"closed @ {ev['price']:.8g} ({ev.get('why', '')})"
     return k
 
 
@@ -280,6 +317,8 @@ class Notifier:
         if self.tg and not (self.tg_token and self.tg_chat):
             log.warning("telegram enabled but TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set; console only")
             self.tg = False
+        self._q: queue.Queue | None = None
+        self._qlock = threading.Lock()
 
     def signal(self, sig: Signal, note: str = "") -> None:
         msg = signal_message(sig, self.cfg, note)
@@ -332,8 +371,36 @@ class Notifier:
                 time.sleep(0.2)
 
     def _telegram(self, text: str, silent: bool = False, keyboard: dict | None = None) -> None:
+        """Queue a message. A background thread sends the queue in order, so trading never waits
+        for Telegram (a rate limit alone can stall a send for 30 s)."""
         if not self.tg:
             return
+        with self._qlock:
+            if self._q is None:
+                self._q = queue.Queue()
+                threading.Thread(target=self._sender, name="telegram-send", daemon=True).start()
+        self._q.put((text, silent, keyboard))
+
+    def flush(self, timeout: float = 15.0) -> bool:
+        """Wait until every queued message was sent (call before the program exits)."""
+        if self._q is None:
+            return True
+        done = threading.Event()
+        self._q.put(done)
+        return done.wait(timeout)
+
+    def _sender(self) -> None:
+        while True:
+            item = self._q.get()
+            if isinstance(item, threading.Event):
+                item.set()
+                continue
+            try:
+                self._send_now(*item)
+            except Exception:                      # never let the sender thread die
+                log.exception("telegram send")
+
+    def _send_now(self, text: str, silent: bool = False, keyboard: dict | None = None) -> None:
         if len(text) > 4000:                       # Telegram's limit is 4096 characters
             text = text[:3990] + "\n…"
         params = {"chat_id": self.tg_chat, "text": text, "parse_mode": "HTML",
@@ -344,10 +411,11 @@ class Notifier:
         url = f"https://api.telegram.org/bot{self.tg_token}/sendMessage"
         for attempt in range(3):
             try:
-                urllib.request.urlopen(url, urllib.parse.urlencode(params).encode(), timeout=10).read()
+                net.request("POST", url, body=urllib.parse.urlencode(params).encode(),
+                            headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=10)
                 return
-            except urllib.error.HTTPError as e:
-                body = e.read()[:300].decode(errors="replace")
+            except net.HTTPStatusError as e:
+                body = e.body[:300].decode(errors="replace")
                 if e.code == 429:                  # rate limited: wait as told, then retry
                     try:
                         wait = json.loads(body)["parameters"]["retry_after"]

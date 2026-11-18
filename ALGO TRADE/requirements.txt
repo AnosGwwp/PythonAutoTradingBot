@@ -1,0 +1,4 @@
+# Optional: lets the signal bot read news headlines with Claude (see README, "News guard").
+# Without it (or without ANTHROPIC_API_KEY) the bot uses keyword rules instead.
+# deploy/install.sh installs it into .venv for you.
+anthropic>=2.10,<3

@@ -17,18 +17,31 @@ from .strategy import CHASE_ATR, evaluate, prepare, prepare_trend, shift_entry, 
 log = logging.getLogger("signals")
 
 
-def run_pair(symbol: str, cfg: dict) -> list:
-    tf, htf, r = cfg["entry_tf"], cfg["trend_tf"], cfg["rules"]
+def run_pair(symbol: str, cfg: dict, get=None) -> list:
+    """`get` is how candles are fetched (default: download). The scanner passes its CandleCache,
+    so a repeated review only downloads the candles that are new since the last one."""
+    S, T = load_series(symbol, cfg, get)
+    return simulate(symbol, S, T, cfg)
+
+
+def load_series(symbol: str, cfg: dict, get=None):
+    """History with indicators, downloaded once; simulate() can then replay it with any rules."""
+    get = get or candles
+    tf, htf = cfg["entry_tf"], cfg["trend_tf"]
     bars = cfg["backtest"]["bars"] + 260
     ratio = max(1, TF_MS[htf] // TF_MS[tf])
-    S = prepare(candles(symbol, tf, bars, cfg["data_source"]))
-    T = prepare_trend(candles(symbol, htf, bars // ratio + 260, cfg["data_source"]))
+    return (prepare(get(symbol, tf, bars, cfg["data_source"])),
+            prepare_trend(get(symbol, htf, bars // ratio + 260, cfg["data_source"])))
+
+
+def simulate(symbol: str, S, T, cfg: dict) -> list:
+    tf, r = cfg["entry_tf"], cfg["rules"]
     trades, open_sig, cool_until, j = [], None, -1, 0
     fee, bar_ms = cfg["risk"]["fee_pct"], TF_MS[tf]
     for i in range(len(S.candles)):
         k = S.candles[i]
         if open_sig is not None:
-            tracker.update(open_sig, k, fee, r["max_bars_open"], bar_ms)
+            tracker.update(open_sig, k, fee, r["max_bars_open"], bar_ms, r.get("breakeven_at_r"))
             if open_sig.status == "closed":
                 if open_sig.traded:
                     trades.append(open_sig)

@@ -18,8 +18,26 @@ if [ -z "$PY" ]; then
   sudo apt-get update -y && sudo apt-get install -y python3.11
   PY="$(command -v python3.11)"
 fi
-echo "$PY" > .python
 echo "using $PY ($("$PY" --version))"
+
+# The bot itself needs no packages. The optional news AI needs `anthropic`, installed into a private
+# .venv (Ubuntu refuses pip installs into the system Python). If that fails, keyword rules are used.
+echo "== 1b/5 Python packages for the news AI =="
+if [ ! -x .venv/bin/python ]; then
+  if ! "$PY" -m venv .venv 2>/dev/null; then
+    VER="$("$PY" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')"
+    sudo apt-get install -y "python$VER-venv" >/dev/null 2>&1 || sudo apt-get install -y python3-venv >/dev/null 2>&1 || true
+    rm -rf .venv
+    "$PY" -m venv .venv 2>/dev/null || echo "(could not create .venv; news will use keyword rules)"
+  fi
+fi
+if [ -x .venv/bin/python ] && .venv/bin/python -m pip install -q --upgrade -r requirements.txt; then
+  PY="$BOT_DIR/.venv/bin/python"
+  echo "news AI package installed; using $PY"
+else
+  echo "(news AI package not installed; news will use keyword rules)"
+fi
+echo "$PY" > .python
 
 echo "== 2/5 clock sync =="
 sudo timedatectl set-ntp true 2>/dev/null || echo "(could not enable NTP; check the clock line in the health check)"
@@ -32,11 +50,16 @@ if [ ! -f .env ]; then
   read -rsp "Bybit API key (Enter = no auto-trading): " BK; echo
   BS=""
   if [ -n "$BK" ]; then read -rsp "Bybit API secret: " BS; echo; fi
+  read -rsp "Anthropic API key for the news AI (Enter = keyword rules): " AK; echo
   umask 077
-  printf 'TELEGRAM_BOT_TOKEN=%s\nTELEGRAM_CHAT_ID=%s\nBYBIT_API_KEY=%s\nBYBIT_API_SECRET=%s\nTZ=Asia/Kolkata\n' \
-    "$TG" "$CHAT" "$BK" "$BS" > .env
+  printf 'TELEGRAM_BOT_TOKEN=%s\nTELEGRAM_CHAT_ID=%s\nBYBIT_API_KEY=%s\nBYBIT_API_SECRET=%s\nANTHROPIC_API_KEY=%s\nTZ=Asia/Kolkata\n' \
+    "$TG" "$CHAT" "$BK" "$BS" "$AK" > .env
 else
   echo ".env already exists, keeping it"
+  if ! grep -q '^ANTHROPIC_API_KEY=' .env; then
+    read -rsp "Anthropic API key for the news AI (Enter = keyword rules): " AK; echo
+    printf 'ANTHROPIC_API_KEY=%s\n' "$AK" >> .env
+  fi
 fi
 chmod 600 .env
 mkdir -p logs

@@ -18,6 +18,7 @@ case "${1:-}" in
               unzip -o ../crypto-signals.zip -x 'crypto-signals/.env' 'crypto-signals/logs/*' -d .. || exit 1
             fi
             chmod +x bot deploy/install.sh
+            if [ -x .venv/bin/python ]; then .venv/bin/python -m pip install -q -r requirements.txt || true; fi
             "$PY" -m unittest discover -s tests -q && sudo systemctl restart $SERVICE && echo "updated + restarted" ;;
   *) echo "usage: ./bot logs | status | restart | stop | start | check | backtest | once | update" ;;
 esac

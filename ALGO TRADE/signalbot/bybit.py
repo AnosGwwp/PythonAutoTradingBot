@@ -6,18 +6,24 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import http.client
 import json
+import logging
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
+
+from . import net
+
+log = logging.getLogger("signals")
 
 HOSTS = {"demo": "https://api-demo.bybit.com",          # demo trading: real prices, fake money
          "testnet": "https://api-testnet.bybit.com",
          "mainnet": "https://api.bybit.com"}
 
-OK_CODES = {0, 110043, 110025, 34040}   # 0 ok; "leverage/position mode/SL not modified" are fine
+# 0 ok; "leverage / position mode / SL not modified" are fine; 110072 "orderLinkId is duplicate"
+# means the order was already placed by an earlier attempt of the same request.
+OK_CODES = {0, 110043, 110025, 34040, 110072}
 UNCERTAIN = -1   # network failure, timeout or HTTP 5xx: Bybit may or may not have executed the request
 
 
@@ -47,18 +53,20 @@ class Bybit:
         self._instr: dict[str, dict] = {}
 
     # ---------------------------------------------------------------- transport
-    def _req(self, method: str, path: str, params: dict | None = None, auth: bool = True) -> dict:
+    def _req(self, method: str, path: str, params: dict | None = None, auth: bool = True,
+             full: bool = False) -> dict:
         try:
-            return self._req1(method, path, params, auth)
+            return self._req1(method, path, params, auth, full)
         except BybitError as e:
             if e.code != 10002 or not auth:          # 10002 = our clock is off: resync once, retry
                 raise
             self.sync_time()
-            return self._req1(method, path, params, auth)
+            return self._req1(method, path, params, auth, full)
 
-    def _req1(self, method: str, path: str, params: dict | None, auth: bool) -> dict:
+    def _req1(self, method: str, path: str, params: dict | None, auth: bool, full: bool = False) -> dict:
+        """`full` returns the whole reply (with retExtInfo) instead of just `result`."""
         params = {k: v for k, v in (params or {}).items() if v is not None}
-        headers = {"User-Agent": "signalbot/1.0", "Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json"}
         if method == "GET":
             payload = urllib.parse.urlencode(params)
             url, data = f"{self.host}{path}" + (f"?{payload}" if payload else ""), None
@@ -70,23 +78,21 @@ class Bybit:
             sign = hmac.new(self.secret, (ts + self.key + self.recv + payload).encode(), hashlib.sha256).hexdigest()
             headers.update({"X-BAPI-API-KEY": self.key, "X-BAPI-TIMESTAMP": ts,
                             "X-BAPI-RECV-WINDOW": self.recv, "X-BAPI-SIGN": sign})
-        req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=15) as r:
-                body = json.loads(r.read())
-        except urllib.error.HTTPError as e:
-            body = e.read()[:200].decode(errors="replace")
+            body = json.loads(net.request(method, url, body=data, headers=headers, timeout=15))
+        except net.HTTPStatusError as e:
+            text = e.body[:200].decode(errors="replace")
             if e.code >= 500:   # gateway/server error: the request may still have been executed
-                raise BybitError(UNCERTAIN, f"HTTP {e.code} (outcome unknown): {body}") from e
-            raise BybitError(e.code, f"HTTP {e.code}: {body}") from e
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+                raise BybitError(UNCERTAIN, f"HTTP {e.code} (outcome unknown): {text}") from e
+            raise BybitError(e.code, f"HTTP {e.code}: {text}") from e
+        except (http.client.HTTPException, OSError) as e:
             raise BybitError(UNCERTAIN, f"network: {e}") from e
-        except json.JSONDecodeError as e:
+        except ValueError as e:
             raise BybitError(UNCERTAIN, f"bad response: {e}") from e
         code = body.get("retCode", -1)
         if code not in OK_CODES:
             raise BybitError(code, body.get("retMsg", ""))
-        return body.get("result") or {}
+        return body if full else (body.get("result") or {})
 
     def get(self, path: str, auth: bool = True, **params) -> dict:
         return self._req("GET", path, params, auth)
@@ -177,6 +183,29 @@ class Bybit:
             "category": "linear", "symbol": symbol, "side": side, "orderType": "Limit", "qty": str(qty),
             "price": str(price), "timeInForce": "GTC", "positionIdx": 0, "reduceOnly": reduce,
             "orderLinkId": self._link()}).get("orderId", "")
+
+    def limit_batch(self, symbol: str, side: str, orders: list[tuple[Decimal, Decimal]]) -> list[str | None]:
+        """Reduce-only GTC limit orders [(qty, price), ...] in ONE request. Returns an error message
+        (or None) per order. Falls back to one request per order if the batch call is refused; the
+        same orderLinkIds are reused, so an order that did go through can't be placed twice."""
+        reqs = [{"symbol": symbol, "side": side, "orderType": "Limit", "qty": str(q), "price": str(p),
+                 "timeInForce": "GTC", "positionIdx": 0, "reduceOnly": True, "orderLinkId": self._link()}
+                for q, p in orders]
+        try:
+            body = self._req("POST", "/v5/order/create-batch", {"category": "linear", "request": reqs}, full=True)
+            ext = (body.get("retExtInfo") or {}).get("list") or []
+            return [None if i >= len(ext) or ext[i].get("code") in OK_CODES
+                    else f"Bybit {ext[i].get('code')}: {ext[i].get('msg')}" for i in range(len(reqs))]
+        except BybitError as e:
+            log.warning("batch order failed (%s); placing the orders one by one", e)
+        out: list[str | None] = []
+        for r in reqs:
+            try:
+                self.post("/v5/order/create", {"category": "linear", **r})
+                out.append(None)
+            except BybitError as e:
+                out.append(str(e))
+        return out
 
     def _link(self) -> str:
         self._n = getattr(self, "_n", 0) + 1

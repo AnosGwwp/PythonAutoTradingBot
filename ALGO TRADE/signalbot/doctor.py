@@ -62,6 +62,7 @@ def run(cfg: dict) -> int:
             return FAIL, "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set (.env)"
         me = json.loads(urllib.request.urlopen(f"https://api.telegram.org/bot{n.tg_token}/getMe", timeout=10).read())
         n.info(f"✅ Health check from <b>{socket.gethostname()}</b>: Telegram works.")
+        n.flush(15)                       # messages are sent in the background; wait for it
         return OK, f"@{me['result']['username']} -> test message sent to chat {n.tg_chat}"
     check("Telegram", tg)
 
@@ -112,6 +113,20 @@ def run(cfg: dict) -> int:
             return WARN, "not reachable right now (the bot retries later)"
         return OK, f"{len(c.events)} high-impact events this week"
     check("Economic calendar", calendar, critical=False)
+
+    def news_ai():
+        from .news_ai import NewsAnalyst
+        a = NewsAnalyst(cfg)
+        if a.client is None:
+            return WARN, f"{a.label}. Optional: add ANTHROPIC_API_KEY to .env for smarter news"
+        sample = [{"title": "Hackers drain $150 million from a major Solana DeFi protocol", "source": "test",
+                   "t": time.time() * 1000, "summary": "", "key": "doctor"}]
+        r = a.assess(sample, ["BTC", "ETH", "SOL"])[0]
+        if r["by"] != "ai":
+            return WARN, f"the API did not answer ({a.error}); keyword rules are used meanwhile"
+        return OK, (f"{a.label} answered: {r['direction']}, severity {r['severity']} "
+                    f"(test cost ≈ ${a.cost_today()[1]:.4f})")
+    check("News AI", news_ai, critical=False)
     check("News feed", feed(FEEDS["CoinDesk"], "CoinDesk"), critical=False)
 
     data_ok = any(n in ("Binance data", "Bybit data") and lvl == OK for n, lvl, _, _ in results)

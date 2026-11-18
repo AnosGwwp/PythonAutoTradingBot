@@ -5,9 +5,9 @@ import http.client
 import json
 import threading
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
+
+from . import net
 
 TF_MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000,
          "2h": 7_200_000, "4h": 14_400_000, "1d": 86_400_000}
@@ -31,12 +31,9 @@ class DataError(RuntimeError):
 
 
 def _get(url: str, timeout: float = 15.0):
-    req = urllib.request.Request(url, headers={"User-Agent": "signalbot/1.0"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read())
-    except (urllib.error.URLError, http.client.HTTPException, TimeoutError, ConnectionError,
-            json.JSONDecodeError) as e:
+        return json.loads(net.request("GET", url, timeout=timeout))
+    except (net.HTTPStatusError, http.client.HTTPException, OSError, ValueError) as e:  # ValueError: bad JSON
         raise DataError(f"{url.split('?')[0]}: {e}") from e
 
 

@@ -17,10 +17,11 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 TOP = "crypto-signals"
-FILES = ["signals.py", "signals.toml", "bot", ".env.example", "VPS_SETUP.md",
+FILES = ["signals.py", "signals.toml", "bot", ".env.example", "VPS_SETUP.md", "requirements.txt",
          "deploy/install.sh", "deploy/crypto-signals.service", "deploy/pack_for_vps.py"]
 GLOBS = ["signalbot/*.py", "tests/test_signals.py", "tests/test_remote.py", "tests/test_trader.py",
-         "tests/test_news_scan.py", "tests/test_learn.py"]
+         "tests/test_news_scan.py", "tests/test_learn.py", "tests/test_efficiency.py", "tests/test_news_ai.py",
+         "tests/test_trade_care.py"]
 STATE = ["logs/signals_state.json", "logs/settings.json", "logs/signals.csv", "logs/news_seen.json",
          "logs/calendar.json", "logs/journal.jsonl", "logs/learn.json"]
 EXECUTABLE = {"bot", "deploy/install.sh"}
@@ -55,7 +56,7 @@ def main() -> None:
                     names.append(rel)
         if a.with_secrets:
             from signalbot.notify import env
-            keys = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "BYBIT_API_KEY", "BYBIT_API_SECRET"]
+            keys = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "BYBIT_API_KEY", "BYBIT_API_SECRET", "ANTHROPIC_API_KEY"]
             body = "".join(f"{k}={env(k)}\n" for k in keys) + "TZ=Asia/Kolkata\n"
             add(z, ".env", body.encode())
             names.append(".env (your keys)")

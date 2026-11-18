@@ -15,6 +15,8 @@ watch_min_score = 75
 entry_tf = "1h"            # timeframe signals are generated on: 15m, 30m, 1h, 2h, 4h
 trend_tf = "4h"            # higher timeframe that must agree with the trade direction
 scan_every_sec = 60        # how often to poll; signals fire only on CLOSED candles
+track_every_sec = 15       # poll faster while trades are open: a TP fill on Bybit moves the stop
+                           # within seconds (cached candles: few extra downloads)
 data_source = "binance"    # "binance" (USDT-M futures) with automatic fallback to "bybit"
 
 [rules]
@@ -27,6 +29,8 @@ tp_r = [1.0, 2.0, 3.0]     # take-profit levels as multiples of risk (R)
 breakout_lookback = 20
 breakout_volume_mult = 1.5
 max_bars_open = 48         # close a signal at market if no SL/TP after this many bars
+# breakeven_at_r = 0.5     # optional: stop to entry once +0.5R in profit (default: only at TP1).
+                           # /review tests this on history and suggests it only if it clearly helps.
 cooldown_bars = 6          # after a signal closes, wait this long before re-signalling that pair
 
 [risk]
@@ -71,10 +75,17 @@ shock_guard = true         # detect sudden moves from 1m candles (faster than an
 shock_mult = 8             # 5-minute move bigger than this x the normal 1-minute range...
 shock_min_pct = 1.2        # ...and at least this %  (about 1 alert/day/coin in a volatile week)
 shock_pause_min = 30       # then no new entries on that coin for this long
-headlines = true           # silent alerts for important headlines on your coins / macro
+headlines = true           # read headlines: which coin, good or bad, how serious, repeated or new
 headline_every_sec = 180
-headline_max_per_hour = 6
+headline_max_per_hour = 6  # notable news alerts per hour (major news always gets through)
 bybit_delistings = true    # alert if Bybit announces a delisting of one of your coins
+ai = true                  # let Claude read the headlines (needs ANTHROPIC_API_KEY; else keyword rules)
+ai_model = "claude-haiku-5-5"   # fast and cheap; "claude-sonnet-5-5" or "claude-opus-5-5" judge more deeply
+block_hours = 4            # after MAJOR news, no new auto-trades AGAINST it on that coin for this long
+block_min_severity = 3     # 3 = major only (hack, delisting, ban, ETF decision, surprise Fed move)
+warn_open_trades = true    # act when serious news goes against a trade you have open:
+exit_on_major = true       #   MAJOR news against it -> close the trade (market-wide: only if the AI read it)
+protect_on_notable = true  #   notable news against it -> stop to entry if in profit, else a loud warning
 
 [learn]
 # The bot journals every closed trade (logs/journal.jsonl) and reviews its history: which kinds of

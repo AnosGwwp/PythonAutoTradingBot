@@ -33,6 +33,20 @@ Resume, Help) and answers commands. Type `/` in the chat to see the full menu:
 The bot obeys only your own chat (`TELEGRAM_CHAT_ID`). Phone changes are saved in
 `logs/settings.json` and override `signals.toml`. Delete that file to reset them.
 
+## Stops
+
+After TP1 the stop moves to entry, so the trade can't lose any more. After TP2 it moves to TP1.
+Three things make sure this really happens on Bybit:
+- **Confirmation.** Every stop move is read back from Bybit, and the alert says "✅ Bybit confirms
+  the stop at ...".
+- **Early moves.** While trades are open, the bot checks every 15 s. As soon as Bybit shows a
+  take-profit fill, the stop is moved, without waiting for the next candle to close.
+- **Stop audit.** On each check, a stop that is missing or looser than it should be is put back,
+  and you're told. A stop you moved closer yourself is left alone.
+
+`/trades` shows each stop's state (not moved yet / at entry / profit locked) and whether Bybit
+agrees.
+
 ## Learning from its own trades
 
 Every closed trade, auto-traded or alert-only, is added to `logs/journal.jsonl`, which is never
@@ -40,13 +54,23 @@ trimmed. Each entry records the indicator values on the signal candle (ADX, RSI,
 strength, distance from the EMA, stop width, time of day), how far price moved for and against
 the trade, and the result.
 
-`/review` (also sent every Sunday at `summary_hour`) looks for kinds of trade that keep losing,
-such as "breakouts on SOL" or "trades with ADX under 20". It shows:
+The journal also records each trade's timeline (TP hits and stop moves, with times), the fill
+compared with the signal price, and what Bybit really booked for it, fetched shortly after the
+close. Trades that closed before the journal existed are added from the state file. `/history`
+lists the latest trades in plain words.
 
-- your live record
-- the same rules over a long backtest
-- the best and worst conditions
-- observations about stops and targets
+`/review` is also sent every Sunday at `summary_hour`. It contains:
+- **Your trades, explained one by one**: hit every target, gave back a profit, failed straight
+  away, traded against the news, filled worse than the signal.
+- **What stands out**: plain takeaways from your live trades, and how they compare with the
+  history for the same weeks.
+- **What-if tests**: the same history replayed with other settings (strength filter, earlier
+  breakeven, other targets, one setup only). A change is suggested only if it beats the current
+  rules in both the older and the newer half of the history.
+- **Losing patterns**, such as "breakouts on SOL", to stop auto-trading.
+- **How complete the data is.**
+
+`/apply N` approves suggestion N, whether it's a setting change or a pattern to skip.
 
 The bot gets about one signal a day, far too few to judge on live trades alone, so the evidence
 comes from a rolling backtest of the same rules, with your live trades shown alongside.
@@ -72,9 +96,34 @@ headline:
   at least 1.2% within 5 minutes, you get an alert within about 1–2 minutes, with any related
   headline, and new entries on that coin pause for 30 minutes. Price is the fastest news feed;
   this usually beats the headline itself.
-- **Headlines.** CoinDesk, Cointelegraph, The Block and Decrypt. Important ones about your coins
-  or macro arrive as silent alerts, at most 6 per hour. Bybit delisting notices for your coins are
-  included.
+- **Headlines, read like a trader would.** CoinDesk, Cointelegraph, The Block, Decrypt and
+  Bybit's delisting notices are checked every 3 minutes. Each new headline is assessed for:
+  - which of your coins it concerns, or whether it moves the whole market
+  - whether it's good or bad news
+  - how serious it is: noise, minor, notable or major
+  - whether it repeats a story already seen on another site (counted once, with the number of sites)
+
+  **Claude Haiku 5.5** reads the headlines when `ANTHROPIC_API_KEY` is set, which costs roughly
+  $1 a month. Without a key, or if the API is down, keyword rules give the same kind of answer,
+  less precisely. `/news` shows which one is in use, and today's AI cost.
+
+How news affects trading. The bot never opens a trade because of news.
+- **Major news** (hack, delisting, ban, ETF decision, surprise Fed move): no new auto-trades
+  *against* it on that coin for 4 hours, for example no new SOL longs after a Solana exploit.
+  Trades in the direction of the news are still allowed. Major market-wide news applies to
+  every coin. These alerts arrive with sound.
+- **Notable news** arrives as a silent alert, at most 6 per hour. Notable news doesn't block
+  anything.
+- **News against an open trade:**
+  - **Major news closes the trade.** Market-wide major news closes trades only when the AI read
+    it; keyword rules alone never close every trade at once.
+  - **Notable news moves the stop to entry** if the trade is in profit, and otherwise sends a loud
+    warning.
+  - Each story acts once per trade. Alert-only trades get the same advice to carry out on your
+    exchange. Switch off with `exit_on_major` / `protect_on_notable` in `signals.toml`.
+- **Every signal shows the coin's news mood** over the last 12 hours, and says when the news
+  leans against the trade. The mood is recorded with each trade, so `/review` can show whether
+  trading against the news loses money.
 
 A signal that lands inside a pause is still sent to you, marked "not auto-traded" with the reason.
 All thresholds are in `[news]` in `signals.toml`.

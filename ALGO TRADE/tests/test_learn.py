@@ -131,6 +131,7 @@ class RuleInScanTests(unittest.TestCase):
                                     "label": "breakout setups"}]}
             trader = mock.Mock(active=True)
             trader.sync.return_value = []
+            trader.audit_stops.return_value = []
             sent = []
             n = mock.Mock()
             n.signal.side_effect = lambda s, note="": sent.append(note)

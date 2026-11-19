@@ -332,9 +332,15 @@ def _takeaways(live: list[dict], gap: float | None, whatifs: list[dict]) -> list
                    "The history test below carries the evidence for now.")
     best = {w["param"]: w for w in whatifs if w.get("robust")}
     if losers and tags.count("gave_back") >= max(2, len(losers) * 0.4):
-        hint = " The breakeven what-if below passed the history test." if "breakeven_at_r" in best else ""
-        out.append(f"{tags.count('gave_back')} of {len(losers)} losses were in profit first: an earlier move "
-                   f"of the stop to entry would have saved them.{hint}")
+        tested = [w for w in whatifs if w["param"] == "breakeven_at_r"]
+        if "breakeven_at_r" in best:
+            hint = " An earlier breakeven also passed the history test below."
+        elif tested:
+            hint = (" But on the history test an earlier breakeven did worse overall: it would also have "
+                    "stopped out trades that went on to win. So this is normal for the rules, not a mistake to fix.")
+        else:
+            hint = ""
+        out.append(f"{tags.count('gave_back')} of {len(losers)} losses were in profit first.{hint}")
     if losers and tags.count("fast_fail") >= max(2, len(losers) * 0.4):
         hint = " A stricter strength filter passed the history test below." if "min_score" in best else ""
         out.append(f"{tags.count('fast_fail')} of {len(losers)} losses failed straight away, which usually "
@@ -374,7 +380,7 @@ def _variants(cfg: dict) -> list[tuple[str, str, object]]:
     return out
 
 
-def what_if(series: dict, cfg: dict, baseline: list[dict], min_trades: int, btc_T=None) -> list[dict]:
+def what_if(series: dict, cfg: dict, baseline: list[dict], min_trades: int, btc=(None, None)) -> list[dict]:
     """Replay the same history with each variant. 'robust' = more total R than now in BOTH the older
     and the newer half, by a real margin: a change that only helps in one half is luck."""
     from .backtest import simulate
@@ -386,7 +392,7 @@ def what_if(series: dict, cfg: dict, baseline: list[dict], min_trades: int, btc_
     out = []
     for name, key, value in _variants(cfg):
         c = {**cfg, "rules": {**cfg["rules"], key: value}}
-        trades = [to_record(s, "backtest") for sym, (S, T) in series.items() for s in simulate(sym, S, T, c, btc_T)]
+        trades = [to_record(s, "backtest") for sym, (S, T) in series.items() for s in simulate(sym, S, T, c, btc[1], btc[0])]
         if not trades:
             continue
         total = sum(t["realized_r"] for t in trades)
@@ -450,7 +456,7 @@ def build_report(history: list[dict], live: list[dict], rules: list[dict], cfg: 
     lines += ["", "<b>💡 What stands out</b>"] + [f"• {x}" for x in _takeaways(live, gap, whatifs)]
 
     # 3. the same rules over a long history, and what-if tests
-    pairs = ", ".join(coin(p) for p in dict.fromkeys(cfg["pairs"] + cfg.get("watch_pairs", [])))
+    pairs = ", ".join(coin(p) for p in dict.fromkeys(cfg["pairs"] + cfg.get("extra_pairs", []) + cfg.get("watch_pairs", [])))
     pool = [t for t in history if not _blocked(t, rules)]
     lines += ["", f"<b>🧪 History test</b>  <i>(same rules, last {cfg['backtest']['bars']} × {cfg['entry_tf']}, {pairs})</i>"]
     if failed:
@@ -510,9 +516,12 @@ def review(cfg: dict, get=None) -> str:
     """Load history once, replay the current rules and each what-if variant, analyse the journal,
     save the numbered suggestions for /apply, return the report.
     `get` fetches candles (the scanner passes its cache, so only new candles are downloaded)."""
-    from .backtest import btc_trend, load_series, simulate     # imported here: only needed for a review
+    from .backtest import btc_series, load_series, simulate     # imported here: only needed for a review
+    # A long history: suggestions judged on a few months often fail over a year.
+    bars = int(cfg.get("learn", {}).get("history_bars", 8760))
+    cfg = {**cfg, "backtest": {**cfg.get("backtest", {}), "bars": bars}}
     log_dir = Path(cfg["alerts"]["log_dir"])
-    pairs = list(dict.fromkeys(cfg["pairs"] + cfg.get("watch_pairs", [])))
+    pairs = list(dict.fromkeys(cfg["pairs"] + cfg.get("extra_pairs", []) + cfg.get("watch_pairs", [])))
 
     def one(p):
         try:
@@ -524,16 +533,16 @@ def review(cfg: dict, get=None) -> str:
         loaded = dict(zip(pairs, pool.map(one, pairs)))
     series = {p: v for p, v in loaded.items() if v is not None}
     failed = [coin(p) for p, v in loaded.items() if v is None]
-    btc_T = None
-    if cfg["rules"].get("btc_confirm"):
-        try:
-            btc_T = series["BTCUSDT"][1] if "BTCUSDT" in series else btc_trend(cfg, get)
-        except Exception as e:
-            log.warning("review: no Bitcoin trend for the BTC filter: %s", e)
-    history = [to_record(s, "backtest") for p, (S, T) in series.items() for s in simulate(p, S, T, cfg, btc_T)]
+    btc = (None, None)                     # Bitcoin's series, for the Bitcoin filters
+    try:
+        btc = btc_series(cfg, get, series.get("BTCUSDT"))
+    except Exception as e:
+        log.warning("review: no Bitcoin data for the BTC filters: %s", e)
+    history = [to_record(s, "backtest") for p, (S, T) in series.items()
+               for s in simulate(p, S, T, cfg, btc[1], btc[0])]
     rules = cfg.get("learn_rules", [])
     pool_now = [t for t in history if not _blocked(t, rules)]
-    whatifs = what_if(series, cfg, pool_now, int(cfg.get("learn", {}).get("min_trades", 30)), btc_T)
+    whatifs = what_if(series, cfg, pool_now, int(cfg.get("learn", {}).get("min_trades", 30)), btc)
     text, sugg = build_report(history, load_journal(log_dir), rules, cfg, failed, whatifs)
     save_suggestions(log_dir, sugg)
     return text

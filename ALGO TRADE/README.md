@@ -23,7 +23,7 @@ Resume, Help) and answers commands. Type `/` in the chat to see the full menu:
 | `/scan` | Check all pairs immediately |
 | `/pause`, `/resume` | Stop or restart new signals. Open trades are still tracked while paused. |
 | `/capital 3000`, `/risk 1`, `/lev 10` | Account size, % lost at the stop, exchange leverage |
-| `/add SUI`, `/watch DOGE`, `/remove SUI`, `/pairs` | Main pairs (loud), watchlist (silent) |
+| `/add SUI`, `/extra ZEC`, `/watch DOGE`, `/remove SUI`, `/pairs` | Main pairs, extra pairs (auto-traded at half risk, own slot), watchlist (silent). Names work too: `/extra zcash` |
 | `/minscore 70`, `/tf 4h` | Signal strength filter, chart timeframe |
 | `/close BTC`, `/closeall` | Close one trade or all bot trades (on Bybit too) and record the result |
 | `/balance`, `/autotrade on/off` | Bybit equity and positions; switch order placing on or off |
@@ -161,7 +161,8 @@ currently set to `env = "demo"`, Bybit Demo Trading: real prices, play money.
 
 1. **Checks.** The trade is skipped, and the alert says why, if:
    - the pair is on the watchlist
-   - 3 bot trades are already open, or 2 in the same direction (`max_same_direction`: BTC, ETH
+   - (extra pairs) another extra-pair trade is already open: they share one slot of their own
+   - (main pairs) 3 bot trades are already open, or 2 in the same direction (`max_same_direction`: BTC, ETH
      and SOL usually move together, so a third short is mostly the same bet again)
    - today's losses have reached `max_daily_loss_pct`. This counts closed trades as Bybit booked
      them (real fills and fees) plus open bot trades that are currently losing.
@@ -273,6 +274,38 @@ full history is in `logs/signals.csv`.
 **Rejected,** because they made things worse in at least one half: 4h chart, shorter or longer
 time stops, earlier breakeven, tighter or wider targets, ADX rising, session filters, min
 strength 70+.
+
+**Round 2 (stricter test).**
+- **Method:** ideas were chosen using only the first 60% of the year. The final exam, run once,
+  used the last 40% plus 6 coins never used before (TRX, LTC, DOT, NEAR, SUI, APT).
+- **One new rule passed:** `alt_must_lag_btc`. Altcoins trade only when they moved *less* than
+  Bitcoin in the trade direction over the last 24h. In a Bitcoin-led trend, the laggard still has
+  its catch-up ahead.
+
+| Final exam | Before | With the rule |
+| --- | --- | --- |
+| Last 40% of the year, 9 coins | −0.008R | **+0.086R** |
+| 6 unseen coins, whole year | −0.064R | **+0.050R** |
+
+- **Whole account** (your 3 coins, real limits of 3 open and 2 per direction): **+0.105R** per
+  trade over the year (+0.141R in the last 40%), worst drawdown 16.6R.
+- **Not kept:**
+  - "Skip ADX 25–35" helped only on the coins it was found on, not on new coins.
+  - **More coins made the account worse**: 9 coins −0.011R, 15 coins −0.058R. Their trades take
+    the 3 slots before the better BTC, ETH and SOL setups, and they lose together when the market
+    turns. So extra coins get a **lane of their own** instead (below).
+
+### Extra pairs (BNB, HYPE, ZEC)
+
+`extra_pairs` are auto-traded without touching the main pairs: they never use one of the 3 main
+slots or the 2-per-direction limit. Instead they share **one slot** (`extra_max_open = 1`) and risk
+**half** the normal amount (`extra_risk_mult = 0.5`). Same strategy and filters otherwise.
+
+1-year test with this setup: main lane unchanged (+23.0R), extra lane **+2.0R** on top. Per coin:
+ZEC +3.5R, HYPE −0.8R, BNB −0.4R, so the gain is small and mostly from ZEC. `/review` shows how
+they do live; `/remove HYPE` (or BNB) if they keep losing.
+- **`/review` now tests on a full year** (`[learn] history_bars`), because 125 days produced
+  suggestions that didn't hold up.
 
 **Honest verdict:** the edge is thin. It is about breakeven-to-small-positive, and it is positive
 on your 3 coins in both halves. Most of the improvement is cutting costs and bad trades. Keep

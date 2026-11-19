@@ -21,7 +21,7 @@ from decimal import Decimal
 
 from .bybit import UNCERTAIN, Bybit, BybitError, floor_step, round_tick
 from .data import TF_MS
-from .notify import coin, env, px, r_usd, sizing
+from .notify import coin, env, is_extra, pair_cfg, px, r_usd, sizing
 from .strategy import CHASE_ATR, Signal, shift_entry
 
 log = logging.getLogger("signals")
@@ -109,12 +109,21 @@ class Trader:
         t = self.t
         if sig.symbol in self.cfg.get("watch_pairs", []) and not t.get("trade_watchlist", False):
             return "🤖 Not auto-traded (watchlist pair)."
-        if sum(s.traded or bool(s.pending) for s in open_sigs) >= t.get("max_open_trades", 3):
-            return "🤖 Not auto-traded: max open trades reached."
-        same = sum((s.traded or bool(s.pending)) and s.side == sig.side for s in open_sigs)
-        if same >= t.get("max_same_direction", 2):
-            return (f"🤖 Not auto-traded: {same} {sig.side} trade(s) already open. Coins mostly move "
-                    "together, so another one would just double the same bet.")
+        # Two lanes: main pairs share max_open_trades / max_same_direction; extra pairs have their own
+        # slot(s), so they never take room from the main pairs (tested: sharing cost the account half
+        # its profit). The daily loss limit below covers the whole account.
+        extra = is_extra(sig.symbol, self.cfg)
+        active = [s for s in open_sigs if (s.traded or bool(s.pending)) and is_extra(s.symbol, self.cfg) == extra]
+        if extra:
+            if len(active) >= t.get("extra_max_open", 1):
+                return "🤖 Not auto-traded: the extra-pairs slot is in use (extra pairs trade one at a time)."
+        else:
+            if len(active) >= t.get("max_open_trades", 3):
+                return "🤖 Not auto-traded: max open trades reached."
+            same = sum(s.side == sig.side for s in active)
+            if same >= t.get("max_same_direction", 2):
+                return (f"🤖 Not auto-traded: {same} {sig.side} trade(s) already open. Coins mostly move "
+                        "together, so another one would just double the same bet.")
         try:
             positions = self.ex.positions()          # one call serves both checks below
             limit = self.cfg["risk"]["account_size"] * t.get("max_daily_loss_pct", 3) / 100
@@ -146,7 +155,8 @@ class Trader:
         plan = replace(sig)                        # size on a copy anchored at the entry price;
         if not limit:                              # the alert keeps its levels if we skip
             shift_entry(plan, now)
-        s = sizing(plan, {**self.cfg, "risk": {**self.cfg["risk"], "account_size": capital}})
+        base = pair_cfg(self.cfg, sym)              # extra pairs: reduced risk
+        s = sizing(plan, {**base, "risk": {**base["risk"], "account_size": capital}})
         lev = max(1, min(s["lev"], int(info["max_lev"])))
         qty = floor_step(min(s["qty"], info["max_mkt_qty"]), info["qty_step"])
         if float(qty) < info["min_qty"] or float(qty) * plan.entry < info["min_notional"]:

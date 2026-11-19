@@ -25,7 +25,8 @@ log = logging.getLogger("signals")
 TREND_FOR = {"15m": "1h", "30m": "4h", "1h": "4h", "2h": "1d", "4h": "1d"}
 
 # setting name -> (config section or None, field)
-KEYS = {"pairs": (None, "pairs"), "watch_pairs": (None, "watch_pairs"), "entry_tf": (None, "entry_tf"),
+KEYS = {"pairs": (None, "pairs"), "watch_pairs": (None, "watch_pairs"), "extra_pairs": (None, "extra_pairs"),
+        "entry_tf": (None, "entry_tf"),
         "trend_tf": (None, "trend_tf"), "paused": (None, "paused"), "min_score": ("rules", "min_score"),
         "account_size": ("risk", "account_size"), "risk_pct": ("risk", "risk_pct"),
         "leverage": ("risk", "leverage"), "autotrade": ("trading", "enabled"),
@@ -61,6 +62,7 @@ COMMAND_MENU = [
     ("settings", "Show all settings"),
     ("pairs", "Show your pairs"),
     ("add", "Add a main pair, e.g. /add SUI"),
+    ("extra", "Auto-trade a coin at half risk in its own slot, e.g. /extra ZEC"),
     ("watch", "Add a low-priority pair, e.g. /watch DOGE"),
     ("remove", "Remove a pair, e.g. /remove SUI"),
     ("risk", "Risk % per trade, e.g. /risk 1"),
@@ -103,6 +105,7 @@ HELP = """🤖 <b>Phone controls</b>
 <b>Pairs</b>
 /pairs  — list them
 /add SUI  — main pair (loud alert)
+/extra ZEC  — extra pair: auto-traded at half risk, one at a time
 /watch DOGE  — low-priority (silent, stronger setups only)
 /remove SUI
 
@@ -150,8 +153,16 @@ def save_setting(cfg: dict, key: str, value) -> None:
     tmp.replace(p)
 
 
+# coin names people type -> ticker
+COIN_NAMES = {"BITCOIN": "BTC", "ETHEREUM": "ETH", "ETHER": "ETH", "SOLANA": "SOL", "ZCASH": "ZEC",
+              "HYPERLIQUID": "HYPE", "BINANCE": "BNB", "BINANCECOIN": "BNB", "RIPPLE": "XRP", "DOGECOIN": "DOGE",
+              "CARDANO": "ADA", "AVALANCHE": "AVAX", "CHAINLINK": "LINK", "POLKADOT": "DOT", "LITECOIN": "LTC",
+              "TRON": "TRX", "TONCOIN": "TON", "SUI": "SUI", "APTOS": "APT", "ARBITRUM": "ARB", "OPTIMISM": "OP"}
+
+
 def normalize_pair(text: str) -> str | None:
     s = re.sub(r"[^A-Z0-9]", "", text.upper())
+    s = COIN_NAMES.get(s, s)
     if s.endswith("USDC"):
         s = s[:-4] + "USDT"          # signals use USDT-perp prices; USDC trades within cents
     elif not s.endswith("USDT"):
@@ -282,6 +293,7 @@ class Remote:
         lines = ["📊 <b>Status</b>  ·  " + ("⏸ <b>PAUSED</b> (open trades still managed)" if paused else "✅ scanning"),
                  "",
                  f"👀 {self._names(cfg['pairs'])}"
+                 + (f"  ·  extra {self._names(cfg.get('extra_pairs', []))}" if cfg.get("extra_pairs") else "")
                  + (f"  ·  watchlist {self._names(cfg.get('watch_pairs', []))}" if cfg.get("watch_pairs") else "")
                  + f"  ·  {cfg['entry_tf']} chart",
                  f"💰 ${rk['account_size']:,.0f}  ·  risk <b>${risk_amt:,.0f}</b> per trade ({rk['risk_pct']:g}%)  ·  "
@@ -372,6 +384,7 @@ class Remote:
             f"Chart: {cfg['entry_tf']} (trend {cfg['trend_tf']})   /tf",
             f"Min strength: {cfg['rules']['min_score']} (watchlist {cfg.get('watch_min_score', 75)})   /minscore",
             f"Main pairs: {self._names(cfg['pairs'])}",
+            f"Extra pairs (half risk): {self._names(cfg.get('extra_pairs', [])) or '-'}   /extra",
             f"Watchlist: {self._names(cfg.get('watch_pairs', [])) or '-'}",
             f"New signals: {'⏸ paused' if cfg.get('paused') else 'on'}",
             "",
@@ -381,9 +394,13 @@ class Remote:
     def cmd_pairs(self, args):
         with self.lock:
             main, watch = self.cfg["pairs"], self.cfg.get("watch_pairs", [])
-        return (f"🔔 <b>Main</b> (loud): {self._names(main) or '-'}\n"
-                f"👀 <b>Watchlist</b> (silent, strength ≥ {self.cfg.get('watch_min_score', 75)}): "
-                f"{self._names(watch) or '-'}\n\n/add COIN  ·  /watch COIN  ·  /remove COIN")
+            extra = self.cfg.get("extra_pairs", [])
+            t = self.cfg.get("trading", {})
+        return (f"🔔 <b>Main</b> (auto-traded): {self._names(main) or '-'}\n"
+                f"➕ <b>Extra</b> (auto-traded at {t.get('extra_risk_mult', 0.5):g}x risk, "
+                f"{t.get('extra_max_open', 1)} at a time): {self._names(extra) or '-'}\n"
+                f"👀 <b>Watchlist</b> (silent alerts only, strength ≥ {self.cfg.get('watch_min_score', 75)}): "
+                f"{self._names(watch) or '-'}\n\n/add COIN  ·  /extra COIN  ·  /watch COIN  ·  /remove COIN")
 
     # ---- control
     def cmd_pause(self, args):
@@ -455,7 +472,7 @@ class Remote:
             save_setting(self.cfg, "trend_tf", TREND_FOR[tf])
             # wait for the next fresh candle close instead of firing on an old one
             boundary = int(time.time() * 1000) // TF_MS[tf] * TF_MS[tf]
-            for p in self.cfg["pairs"] + self.cfg.get("watch_pairs", []):
+            for p in self.cfg["pairs"] + self.cfg.get("watch_pairs", []) + self.cfg.get("extra_pairs", []):
                 self.st.last_eval[p] = boundary
         warn = "\n⚠️ 15m lost money in the backtest; 1h or 4h is better." if tf == "15m" else ""
         return f"✅ Chart: <b>{tf}</b> (trend filter {TREND_FOR[tf]}). Takes effect at the next {tf} candle.{warn}"
@@ -463,7 +480,8 @@ class Remote:
     # ---- pairs
     def _add(self, args, key: str, label: str):
         if not args:
-            return f"Which coin? e.g. <code>/{'add' if key == 'pairs' else 'watch'} SUI</code>"
+            cmd = {"pairs": "add", "watch_pairs": "watch", "extra_pairs": "extra"}[key]
+            return f"Which coin? e.g. <code>/{cmd} SUI</code>"
         sym = normalize_pair(args[0])
         if not sym:
             return "That doesn't look like a coin name."
@@ -472,9 +490,9 @@ class Remote:
         except DataError:
             return f"❌ Couldn't find <b>{html.escape(sym)}</b> on Binance/Bybit futures."
         with self.lock:
-            other = "watch_pairs" if key == "pairs" else "pairs"
-            if sym in self.cfg.get(other, []):
-                save_setting(self.cfg, other, [p for p in self.cfg[other] if p != sym])
+            for other in ("pairs", "watch_pairs", "extra_pairs"):    # a coin lives in one list only
+                if other != key and sym in self.cfg.get(other, []):
+                    save_setting(self.cfg, other, [p for p in self.cfg[other] if p != sym])
             cur = list(self.cfg.get(key, []))
             if sym not in cur:
                 cur.append(sym)
@@ -489,6 +507,10 @@ class Remote:
     def cmd_watch(self, args):
         return self._add(args, "watch_pairs", "watchlist (silent alerts)")
 
+    def cmd_extra(self, args):
+        return self._add(args, "extra_pairs", "extra pairs (auto-traded at half risk, one at a time, "
+                                              "never taking room from your main pairs)")
+
     def cmd_remove(self, args):
         sym = normalize_pair(args[0]) if args else None
         if not sym:
@@ -497,7 +519,7 @@ class Remote:
             if self.cfg["pairs"] == [sym]:
                 return "You need at least one main pair. /add another coin first."
             found = False
-            for key in ("pairs", "watch_pairs"):
+            for key in ("pairs", "watch_pairs", "extra_pairs"):
                 if sym in self.cfg.get(key, []):
                     save_setting(self.cfg, key, [p for p in self.cfg[key] if p != sym])
                     found = True

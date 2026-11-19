@@ -157,7 +157,7 @@ class WhatIfTests(unittest.TestCase):
         results = {75: [rec(i, 0.3) for i in range(60)],                         # better everywhere
                    80: [rec(i, 2.0 if i < 30 else -0.5) for i in range(60)]}     # better only in one half
 
-        def fake_sim(sym, S, T, c, btc_T=None):
+        def fake_sim(sym, S, T, c, btc_T=None, btc_S=None):
             ms = c["rules"].get("min_score")
             return [SimpleNamespace(**r) for r in results.get(ms, [])] if sym == "BTCUSDT" else []
         cfg = base_cfg("x")

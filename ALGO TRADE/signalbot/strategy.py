@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 
 from . import indicators as ind
-from .data import Candle
+from .data import TF_MS, Candle
 
 # Don't enter once price has run this many ATRs past the signal close (alerts, auto-trader, backtest).
 CHASE_ATR = 0.25
@@ -117,8 +117,9 @@ def htf_bias(T: Trend, j: int) -> int:
 
 
 def evaluate(S: Series, i: int, T: Trend, j: int, cfg: dict, symbol: str, tf: str,
-             btc_bias: int | None = None) -> Signal | None:
-    """btc_bias: Bitcoin's own higher-timeframe trend (+1/-1/0) for the `btc_confirm` filter."""
+             btc_bias: int | None = None, btc_ret: float | None = None) -> Signal | None:
+    """btc_bias: Bitcoin's own higher-timeframe trend (+1/-1/0), for `btc_confirm`.
+    btc_ret: Bitcoin's price change over the last `lag_hours`, for `alt_must_lag_btc`."""
     r = cfg["rules"]
     lb = r["breakout_lookback"]
     if i < max(210, lb + 2) or j < 0:
@@ -132,6 +133,12 @@ def evaluate(S: Series, i: int, T: Trend, j: int, cfg: dict, symbol: str, tf: st
     # --- filters chosen on a year of data, 9 coins, better in both halves (see README, Strategy) ---
     if r.get("btc_confirm") and btc_bias is not None and not symbol.startswith("BTC") and btc_bias != d:
         return None                      # altcoins rarely trend against Bitcoin
+    lag = max(1, int(r.get("lag_hours", 24) * 3_600_000 // TF_MS.get(tf, 3_600_000)))
+    rs_btc = None                        # how much more the coin moved than Bitcoin, in the trade direction
+    if btc_ret is not None and not symbol.startswith("BTC") and i >= lag:
+        rs_btc = d * ((S.c[i] / S.c[i - lag] - 1) - btc_ret) * 100
+        if r.get("alt_must_lag_btc") and rs_btc >= 0:
+            return None                  # altcoin already ahead of Bitcoin: the catch-up is gone
     if T.e50[j] and abs(T.e50[j] / T.e200[j] - 1) * 100 < r.get("min_trend_spread_pct", 0):
         return None                      # the bigger trend isn't clearly established
 
@@ -214,6 +221,7 @@ def evaluate(S: Series, i: int, T: Trend, j: int, cfg: dict, symbol: str, tf: st
                 "stop_atr": round(dist / a, 3), "atr_pct": round(a / entry * 100, 3),
                 "hour_utc": time.gmtime(S.candles[i].tc / 1000).tm_hour,
                 "adx_slope": round(ax - S.adx[i - 3], 2),                 # trend strength building or fading
+                "rs_vs_btc": round(rs_btc, 3) if rs_btc is not None else None,   # + = ahead of Bitcoin
                 "close_pos": round(((c[i] - l[i]) / rng if d == 1 else (h[i] - c[i]) / rng) if rng > 0 else 0.5, 3)}
     return Signal(symbol, "LONG" if d == 1 else "SHORT", tf, S.candles[i].tc, entry, sl, tps,
                   score, setups, reasons, a, sl_now=sl, last_t=S.candles[i].t, features=features)

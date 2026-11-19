@@ -70,7 +70,7 @@ NAMES = {
     "DOGE": ["dogecoin"], "BNB": ["bnb chain", "binance coin"], "ADA": ["cardano", "charles hoskinson"],
     "AVAX": ["avalanche"], "LINK": ["chainlink"], "DOT": ["polkadot"], "LTC": ["litecoin"], "SUI": ["sui network", "mysten"],
     "TON": ["toncoin", "telegram open network"], "TRX": ["tron", "justin sun"], "PEPE": ["pepe"], "SHIB": ["shiba inu"],
-    "ARB": ["arbitrum"], "OP": ["optimism"], "APT": ["aptos"], "NEAR": ["near protocol"], "HYPE": ["hyperliquid"],
+    "ARB": ["arbitrum"], "OP": ["optimism"], "APT": ["aptos"], "NEAR": ["near protocol"], "HYPE": ["hyperliquid"], "ZEC": ["zcash", "electric coin company"],
     "TIA": ["celestia"], "INJ": ["injective"], "SEI": ["sei network"], "WIF": ["dogwifhat"], "BCH": ["bitcoin cash"],
 }
 

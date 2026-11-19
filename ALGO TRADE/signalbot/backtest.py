@@ -23,7 +23,8 @@ def run_pair(symbol: str, cfg: dict, get=None) -> list:
     """`get` is how candles are fetched (default: download). The scanner passes its CandleCache,
     so a repeated review only downloads the candles that are new since the last one."""
     S, T = load_series(symbol, cfg, get)
-    return simulate(symbol, S, T, cfg, btc_trend(cfg, get, T if symbol.startswith("BTC") else None))
+    bS, bT = btc_series(cfg, get, (S, T) if symbol.startswith("BTC") else None)
+    return simulate(symbol, S, T, cfg, bT, bS)
 
 
 def load_series(symbol: str, cfg: dict, get=None):
@@ -34,6 +35,17 @@ def load_series(symbol: str, cfg: dict, get=None):
     ratio = max(1, TF_MS[htf] // TF_MS[tf])
     return (prepare(get(symbol, tf, bars, cfg["data_source"])),
             prepare_trend(get(symbol, htf, bars // ratio + 260, cfg["data_source"])))
+
+
+def btc_series(cfg: dict, get=None, have=None):
+    """(Bitcoin entry-timeframe Series, Bitcoin trend), for the Bitcoin filters; (None, None) if off.
+    `have`: the pair's own (S, T) when the pair IS Bitcoin."""
+    r = cfg["rules"]
+    if not (r.get("btc_confirm") or r.get("alt_must_lag_btc")):
+        return None, None
+    if have is not None:
+        return have
+    return load_series("BTCUSDT", cfg, get)
 
 
 def btc_trend(cfg: dict, get=None, have=None):
@@ -48,9 +60,12 @@ def btc_trend(cfg: dict, get=None, have=None):
     return prepare_trend(get("BTCUSDT", htf, bars, cfg["data_source"]))
 
 
-def simulate(symbol: str, S, T, cfg: dict, btc_T=None) -> list:
-    """btc_T: Bitcoin's higher-timeframe Trend, for the btc_confirm filter (None: filter not applied)."""
+def simulate(symbol: str, S, T, cfg: dict, btc_T=None, btc_S=None) -> list:
+    """btc_T / btc_S: Bitcoin's trend and entry-timeframe series, for the Bitcoin filters
+    (None: that filter is not applied)."""
     tf, r = cfg["entry_tf"], cfg["rules"]
+    lag = max(1, int(r.get("lag_hours", 24) * 3_600_000 // TF_MS[tf]))
+    btc_at = {k.tc: n for n, k in enumerate(btc_S.candles)} if btc_S is not None else {}
     jb = 0
     trades, open_sig, cool_until, j = [], None, -1, 0
     fee, bar_ms = tracker.fees_of(cfg), TF_MS[tf]
@@ -71,7 +86,9 @@ def simulate(symbol: str, S, T, cfg: dict, btc_T=None) -> list:
         if btc_T is not None:
             jb = max(0, trend_index(btc_T, k.tc, jb))
             btc = htf_bias(btc_T, jb)
-        sig = evaluate(S, i, T, j, cfg, symbol, tf, btc)
+        bi = btc_at.get(k.tc)
+        btc_ret = btc_S.c[bi] / btc_S.c[bi - lag] - 1 if bi is not None and bi >= lag else None
+        sig = evaluate(S, i, T, j, cfg, symbol, tf, btc, btc_ret)
         if sig:
             if limit:                                # limit order at the signal price, valid 1 candle:
                 nxt = S.candles[i + 1]               # filled only if the next candle trades through it
@@ -104,7 +121,7 @@ def stats(trades: list) -> dict:
 
 
 def report(cfg: dict) -> None:
-    pairs = cfg["pairs"] + [p for p in cfg.get("watch_pairs", []) if p not in cfg["pairs"]]
+    pairs = list(dict.fromkeys(cfg["pairs"] + cfg.get("extra_pairs", []) + cfg.get("watch_pairs", [])))
     print(f"\nBacktest: {cfg['backtest']['bars']} x {cfg['entry_tf']} candles per pair, "
           f"trend filter {cfg['trend_tf']}, min score {cfg['rules']['min_score']}, "
           f"{'limit' if cfg.get('trading', {}).get('limit_entry') else 'market'} entry, fees "

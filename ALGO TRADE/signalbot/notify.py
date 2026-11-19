@@ -72,9 +72,21 @@ def sizing(sig: Signal, cfg: dict) -> dict:
             "capped": capped, "liq": liq}
 
 
+def is_extra(symbol: str, cfg: dict) -> bool:
+    return symbol in cfg.get("extra_pairs", []) and symbol not in cfg.get("pairs", [])
+
+
+def pair_cfg(cfg: dict, symbol: str) -> dict:
+    """Settings for one pair: extra pairs trade at a fraction of the normal risk (default half)."""
+    if is_extra(symbol, cfg):
+        m = cfg.get("trading", {}).get("extra_risk_mult", 0.5)
+        return {**cfg, "risk": {**cfg["risk"], "risk_pct": cfg["risk"]["risk_pct"] * m}}
+    return cfg
+
+
 def r_usd(sig: Signal, cfg: dict) -> float:
     """Dollars per 1R for this signal (fixed when it was sent)."""
-    return sig.risk_usd or sizing(sig, cfg)["risk_amt"]
+    return sig.risk_usd or sizing(sig, pair_cfg(cfg, sig.symbol))["risk_amt"]
 
 
 def strength(score: int) -> str:
@@ -170,7 +182,7 @@ def stop_label(sig: Signal) -> str:
 
 
 def signal_message(sig: Signal, cfg: dict, note: str = "") -> str:
-    s = sizing(sig, cfg)
+    s = sizing(sig, pair_cfg(cfg, sig.symbol))
     if sig.traded:      # show what was really done on the exchange
         s["qty"], s["notional"] = sig.qty, sig.qty * sig.entry
         s["margin"], s["risk_amt"] = s["notional"] / s["lev"], sig.risk_usd
@@ -184,6 +196,8 @@ def signal_message(sig: Signal, cfg: dict, note: str = "") -> str:
             f"  ·  {'★' * stars}{'☆' * (5 - stars)} {sig.score}")
     if is_watch(sig, cfg):
         head += "  ·  👀 watchlist"
+    elif is_extra(sig.symbol, cfg):
+        head += "  ·  ➕ extra pair (half risk)"
     lines = [head]
     if note:
         lines += ["", note]

@@ -8,6 +8,12 @@
 # Signals use Binance USDT-perp prices; USDC pairs trade within cents, so levels apply to both.
 pairs = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
+# EXTRA pairs: auto-traded in a lane of their own, so they never take a slot (or a same-direction
+# slot) from the main pairs. Half risk, one open trade at a time across all of them (see [trading]).
+# 1-year test: main lane unchanged, extra lane +2.0R (ZEC +3.5R, HYPE -0.8R, BNB -0.4R) -> small.
+# phone: /extra COIN  ·  /remove COIN
+extra_pairs = ["BNBUSDT", "HYPEUSDT", "ZECUSDT"]
+
 # LOW-PRIORITY pairs: need a stronger setup (watch_min_score) and arrive as SILENT notifications.
 watch_pairs = []
 watch_min_score = 75
@@ -38,6 +44,8 @@ skip_wide_stops = true     # skip if the swing stop is beyond sl_atr_max: a capp
 min_trend_spread_pct = 1.0 # the 4h EMA50 must be at least 1% away from the EMA200: a clear bigger trend
 btc_confirm = true         # ETH, SOL and other altcoins only trade in the direction of Bitcoin's 4h trend
 max_volume_ratio = 2.5     # skip entry candles with more than 2.5x normal volume (often exhaustion)
+alt_must_lag_btc = true    # altcoins only when they moved LESS than Bitcoin (in the trade direction) over
+lag_hours = 24             #   the last 24h: in a Bitcoin-led trend the laggard has the catch-up ahead
 
 [risk]
 # These can also be changed from your phone: /capital /risk /lev  (saved in logs/settings.json,
@@ -62,6 +70,8 @@ isolated = true            # put the account in isolated margin mode
 trade_watchlist = false    # also auto-trade low-priority (watchlist) pairs?
 max_open_trades = 3        # at most this many bot positions at once
 max_same_direction = 2     # at most this many LONGs (or SHORTs) at once: BTC/ETH/SOL usually move together
+extra_max_open = 1         # extra pairs: at most this many open at once (their own slot)
+extra_risk_mult = 0.5      # extra pairs risk this x risk_pct (0.5 = half the normal risk)
 limit_entry = true         # enter with a limit order at the signal price (maker fee, better price), valid
                            # for one candle; not filled -> skipped. false = market order at once.
 max_daily_loss_pct = 3     # no NEW trades for the rest of the day once today's loss (closed trades as
@@ -103,6 +113,8 @@ protect_on_notable = true  #   notable news against it -> stop to entry if in pr
 enabled = true
 review_weekday = 6         # weekly review on Telegram: 0 = Monday ... 6 = Sunday (at summary_hour)
 min_trades = 30            # never suggest anything from fewer trades than this
+history_bars = 8760        # the review tests on this many candles (8760 x 1h = one year); short
+                           # histories produce suggestions that don't hold up
 
 [alerts]
 telegram = true            # uses TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID (environment or .env file)

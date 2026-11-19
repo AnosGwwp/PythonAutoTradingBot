@@ -130,6 +130,20 @@ class RemoteTest(unittest.TestCase):
         self.r.handle("/remove sui")
         self.assertEqual(self.cfg["pairs"], ["BTCUSDT"])
 
+    def test_extra_pair_and_coin_names(self):
+        self.assertEqual(remote.normalize_pair("zcash"), "ZECUSDT")
+        self.assertEqual(remote.normalize_pair("Hyperliquid"), "HYPEUSDT")
+        with mock.patch.object(remote, "price", return_value=1.0):
+            self.assertIn("half risk", self.r.handle("/extra ZCASH"))
+            self.r.handle("/watch hype")
+            self.r.handle("/extra hype")                      # moves it from watchlist to extra
+        self.assertEqual(self.cfg["extra_pairs"], ["ZECUSDT", "HYPEUSDT"])
+        self.assertEqual(self.cfg["watch_pairs"], [])
+        self.assertEqual(self.saved()["extra_pairs"], ["ZECUSDT", "HYPEUSDT"])
+        self.assertIn("Extra", self.r.handle("/pairs"))
+        self.r.handle("/remove zec")
+        self.assertEqual(self.cfg["extra_pairs"], ["HYPEUSDT"])
+
     def test_close_trade(self):
         self.st.open["BTCUSDT"] = sig()
         with mock.patch.object(remote, "price", return_value=101.5):

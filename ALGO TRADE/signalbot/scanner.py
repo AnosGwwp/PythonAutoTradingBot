@@ -27,7 +27,7 @@ import html
 from . import learn, tracker
 from .data import TF_MS, CandleCache, DataError, candles, price
 from .news import SEVERITY, News
-from .notify import Notifier, coin, event_text, format_signal, money, plain, px, r_usd, sizing
+from .notify import Notifier, coin, event_text, format_signal, money, pair_cfg, plain, px, r_usd, sizing
 from .remote import KEYBOARD, Remote
 from .strategy import Signal, evaluate, htf_bias, prepare, prepare_trend, trend_index
 from .trader import Trader
@@ -92,18 +92,25 @@ def _evaluate_pair(pair: str, cfg: dict, cache: CandleCache | None) -> tuple[str
     T = prepare_trend(get(pair, cfg["trend_tf"], HISTORY, src))
     i = len(S.candles) - 1
     j = trend_index(T, S.candles[i].tc)
-    btc = None
-    if cfg["rules"].get("btc_confirm") and not pair.startswith("BTC"):
-        try:                                     # Bitcoin's own trend (cached, so no extra download)
+    btc = btc_ret = None
+    r = cfg["rules"]
+    if (r.get("btc_confirm") or r.get("alt_must_lag_btc")) and not pair.startswith("BTC"):
+        try:                                     # Bitcoin's own trend and move (cached: no extra download)
             BT = prepare_trend(get("BTCUSDT", cfg["trend_tf"], HISTORY, src))
             btc = htf_bias(BT, trend_index(BT, S.candles[i].tc))
+            bc = get("BTCUSDT", tf, HISTORY, src)
+            at = {k.tc: n for n, k in enumerate(bc)}.get(S.candles[i].tc)
+            lag = max(1, int(r.get("lag_hours", 24) * 3_600_000 // TF_MS[tf]))
+            if at is not None and at >= lag:
+                btc_ret = bc[at].c / bc[at - lag].c - 1
         except DataError as e:
-            log.warning("no Bitcoin trend for the BTC filter (%s); %s is checked without it", e, pair)
-    return pair, evaluate(S, i, T, j, cfg, pair, tf, btc), S.candles[i].tc
+            log.warning("no Bitcoin data for the BTC filters (%s); %s is checked without them", e, pair)
+    return pair, evaluate(S, i, T, j, cfg, pair, tf, btc, btc_ret), S.candles[i].tc
 
 
 def all_pairs(cfg: dict) -> list[str]:
-    return list(dict.fromkeys(cfg["pairs"] + cfg.get("watch_pairs", [])))
+    """Main pairs, extra pairs (auto-traded in their own lane), then the watchlist."""
+    return list(dict.fromkeys(cfg["pairs"] + cfg.get("extra_pairs", []) + cfg.get("watch_pairs", [])))
 
 
 def scan_once(cfg: dict, st: State, notifier: Notifier, force: bool = False, trader: Trader | None = None,
@@ -192,7 +199,7 @@ def scan_once(cfg: dict, st: State, notifier: Notifier, force: bool = False, tra
             learn.collect_exchange_pnl(cfg, st, trader, now)      # real Bybit P&L for the journal
 
         # 2. pairs whose entry candle has closed since we last looked
-        watch = [p for p in cfg.get("watch_pairs", []) if p not in cfg["pairs"]]
+        watch = [p for p in cfg.get("watch_pairs", []) if p not in cfg["pairs"] + cfg.get("extra_pairs", [])]
         for pair, sig, last_close in evaluated:
             if pair in st.open:
                 continue
@@ -209,7 +216,7 @@ def scan_once(cfg: dict, st: State, notifier: Notifier, force: bool = False, tra
             if not sig:
                 continue
             sig.last_t = last_close - 1   # track from the next minute on
-            sig.risk_usd = sizing(sig, cfg)["risk_amt"]
+            sig.risk_usd = sizing(sig, pair_cfg(cfg, pair))["risk_amt"]
             sig.features["signal_price"] = sig.entry  # the fill may differ: the journal measures slippage
             if news:                      # journaled, so /review can learn whether fighting the news pays
                 sig.features["news"] = news.alignment(pair, sig.side, now)
@@ -419,6 +426,8 @@ def run(cfg: dict) -> int:
     names = lambda ps: ", ".join(coin(p) for p in ps)
     orphans = trader.orphans(list(st.open.values()))
     notifier.info(f"🟢 <b>Scanner started</b>\nWatching {names(cfg['pairs'])} on the {cfg['entry_tf']} chart"
+                  + (f"\nExtra (half risk, one at a time): {names(cfg['extra_pairs'])}"
+                     if cfg.get("extra_pairs") else "")
                   + (f"\nWatchlist (silent): {names(cfg['watch_pairs'])}" if cfg.get("watch_pairs") else "")
                   + f"\nCapital ${rk['account_size']:,.0f}  ·  risk {rk['risk_pct']:g}%  ·  {rk.get('leverage', 1)}x"
                   + f"\nOpen trades being tracked: {len(st.open)}"
@@ -428,8 +437,9 @@ def run(cfg: dict) -> int:
                   + ("\n⏸ New signals are PAUSED (tap ▶️ Resume)" if cfg.get("paused") else "")
                   + ("\n\n📱 Use the buttons below or send /help to control me." if phone else
                      "\n(Telegram is OFF: console alerts only)"), keyboard=KEYBOARD if phone else None)
-    log.info("scanning %s + watchlist %s on %s (trend %s); %d open signals restored. Ctrl+C to stop.",
-             ",".join(cfg["pairs"]), ",".join(cfg.get("watch_pairs", [])) or "-",
+    log.info("scanning %s + extra %s + watchlist %s on %s (trend %s); %d open signals restored. Ctrl+C to stop.",
+             ",".join(cfg["pairs"]), ",".join(cfg.get("extra_pairs", [])) or "-",
+             ",".join(cfg.get("watch_pairs", [])) or "-",
              cfg["entry_tf"], cfg["trend_tf"], len(st.open))
     for s in st.open.values():
         print(format_signal(s, cfg) + f"\n  [open, {s.tp_hit} TP hit, stop now {px(s.sl_now)}]\n")

@@ -63,6 +63,19 @@ class FilterTests(unittest.TestCase):
         self.assertIsNotNone(self.ev(c, symbol="BTCUSDT", btc=-s.d))   # BTC itself isn't filtered
         self.assertIsNotNone(self.ev(c, btc=None))                  # no BTC data: not blocked
 
+    def test_alt_must_lag_btc(self):
+        s = self.ev(rules())
+        S, i = self.S, self.i
+        coin_ret = S.c[i] / S.c[i - 24] - 1
+        c = rules(alt_must_lag_btc=True, lag_hours=24)
+        j = strategy.trend_index(self.T, S.candles[i].tc)
+        ev = lambda sym, btc_ret: strategy.evaluate(S, i, self.T, j, c, sym, "1h", None, btc_ret)
+        self.assertIsNone(ev("ETHUSDT", coin_ret - 0.01 * s.d))       # coin already ahead of Bitcoin
+        self.assertIsNotNone(ev("ETHUSDT", coin_ret + 0.01 * s.d))    # coin lagging: the catch-up is ahead
+        self.assertIsNotNone(ev("BTCUSDT", coin_ret - 0.01 * s.d))    # Bitcoin itself isn't filtered
+        self.assertIsNotNone(ev("ETHUSDT", None))                     # no Bitcoin data: not blocked
+        self.assertLess(ev("ETHUSDT", coin_ret + 0.01 * s.d).features["rs_vs_btc"], 0)   # recorded
+
     def test_other_filters(self):
         self.assertIsNone(self.ev(rules(max_volume_ratio=0.01)))
         self.assertIsNone(self.ev(rules(min_trend_spread_pct=99)))
@@ -211,3 +224,59 @@ class LimitTradingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExtraPairsTest(unittest.TestCase):
+    """HYPE/ZEC/BNB-style coins: their own slot, half risk, never crowding the main pairs."""
+
+    def make(self):
+        c = trader_cfg()
+        c["extra_pairs"] = ["ZECUSDT", "HYPEUSDT"]
+        c["trading"].update(max_open_trades=2, max_same_direction=2, extra_max_open=1, extra_risk_mult=0.5)
+        t = Trader(c)
+        t.ex = FakeEx()
+        return t
+
+    def busy(self, *syms):
+        out = []
+        for s in syms:
+            x = trader_sig(s)
+            x.traded = True
+            out.append(x)
+        return out
+
+    def test_half_risk(self):
+        t, s = self.make(), trader_sig("ZECUSDT")
+        t.open(s, [], [])
+        self.assertTrue(s.traded)
+        self.assertAlmostEqual(s.qty, 10.0)              # $15 risk (half of $30) / $1.5 stop
+
+    def test_main_lane_full_does_not_block_extra(self):
+        t, s = self.make(), trader_sig("ZECUSDT")
+        t.open(s, self.busy("BTCUSDT", "ETHUSDT"), [])
+        self.assertTrue(s.traded)
+
+    def test_extra_does_not_take_a_main_slot(self):
+        t, s = self.make(), trader_sig("ETHUSDT")
+        t.open(s, self.busy("BTCUSDT", "ZECUSDT"), [])
+        self.assertTrue(s.traded)
+
+    def test_one_extra_at_a_time(self):
+        t, s = self.make(), trader_sig("HYPEUSDT")
+        self.assertIn("extra-pairs slot", t.open(s, self.busy("ZECUSDT"), []))
+        self.assertFalse(s.traded)
+
+    def test_a_main_pair_listed_as_extra_stays_main(self):
+        from signalbot.notify import is_extra, pair_cfg
+        c = self.make().cfg
+        c["extra_pairs"].append("BTCUSDT")
+        self.assertFalse(is_extra("BTCUSDT", c))
+        self.assertEqual(pair_cfg(c, "BTCUSDT")["risk"]["risk_pct"], 1.0)
+        self.assertEqual(pair_cfg(c, "ZECUSDT")["risk"]["risk_pct"], 0.5)
+
+    def test_config_file_extras(self):
+        with open(Path(__file__).parent.parent / "signals.toml", "rb") as f:
+            c = tomllib.load(f)
+        self.assertEqual(set(c["extra_pairs"]), {"BNBUSDT", "HYPEUSDT", "ZECUSDT"})
+        self.assertFalse(set(c["extra_pairs"]) & set(c["pairs"]))
+        self.assertEqual(c["trading"]["extra_max_open"], 1)

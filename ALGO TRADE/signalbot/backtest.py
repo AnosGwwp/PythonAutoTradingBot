@@ -1,7 +1,9 @@
 """Walk-forward backtest of the exact live rules, with no look-ahead.
 
-A signal on candle i is filled at candle i+1's OPEN (what you'd realistically get),
-then managed by tracker.update() on each following candle. Fees are included.
+Entry like the live bot: with trading.limit_entry, a limit order at the signal price that fills
+only if candle i+1 trades through it (maker fee); otherwise a market order at candle i+1's OPEN.
+Then managed by tracker.update() on each following candle. Fees are included (maker for limit
+orders: limit entry and take-profits; taker for market orders: entry, stop, expiry).
 Like the auto-trader, it skips a signal whose fill would chase price past the "don't chase" level.
 Not modelled: news pauses, max_open_trades / max_same_direction across pairs, and funding fees.
 """
@@ -12,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from . import tracker
 from .data import TF_MS, candles
-from .strategy import CHASE_ATR, evaluate, prepare, prepare_trend, shift_entry, trend_index
+from .strategy import CHASE_ATR, evaluate, htf_bias, prepare, prepare_trend, shift_entry, trend_index
 
 log = logging.getLogger("signals")
 
@@ -21,7 +23,7 @@ def run_pair(symbol: str, cfg: dict, get=None) -> list:
     """`get` is how candles are fetched (default: download). The scanner passes its CandleCache,
     so a repeated review only downloads the candles that are new since the last one."""
     S, T = load_series(symbol, cfg, get)
-    return simulate(symbol, S, T, cfg)
+    return simulate(symbol, S, T, cfg, btc_trend(cfg, get, T if symbol.startswith("BTC") else None))
 
 
 def load_series(symbol: str, cfg: dict, get=None):
@@ -34,10 +36,25 @@ def load_series(symbol: str, cfg: dict, get=None):
             prepare_trend(get(symbol, htf, bars // ratio + 260, cfg["data_source"])))
 
 
-def simulate(symbol: str, S, T, cfg: dict) -> list:
+def btc_trend(cfg: dict, get=None, have=None):
+    """Bitcoin's higher-timeframe trend series, when the btc_confirm filter is on."""
+    if not cfg["rules"].get("btc_confirm"):
+        return None
+    if have is not None:
+        return have
+    get = get or candles
+    tf, htf = cfg["entry_tf"], cfg["trend_tf"]
+    bars = (cfg["backtest"]["bars"] + 260) // max(1, TF_MS[htf] // TF_MS[tf]) + 260
+    return prepare_trend(get("BTCUSDT", htf, bars, cfg["data_source"]))
+
+
+def simulate(symbol: str, S, T, cfg: dict, btc_T=None) -> list:
+    """btc_T: Bitcoin's higher-timeframe Trend, for the btc_confirm filter (None: filter not applied)."""
     tf, r = cfg["entry_tf"], cfg["rules"]
+    jb = 0
     trades, open_sig, cool_until, j = [], None, -1, 0
-    fee, bar_ms = cfg["risk"]["fee_pct"], TF_MS[tf]
+    fee, bar_ms = tracker.fees_of(cfg), TF_MS[tf]
+    limit = bool(cfg.get("trading", {}).get("limit_entry"))      # same entry method as the live bot
     for i in range(len(S.candles)):
         k = S.candles[i]
         if open_sig is not None:
@@ -50,14 +67,22 @@ def simulate(symbol: str, S, T, cfg: dict) -> list:
         if i < cool_until or i + 1 >= len(S.candles):
             continue
         j = max(0, trend_index(T, k.tc, j))
-        sig = evaluate(S, i, T, j, cfg, symbol, tf)
+        btc = None
+        if btc_T is not None:
+            jb = max(0, trend_index(btc_T, k.tc, jb))
+            btc = htf_bias(btc_T, jb)
+        sig = evaluate(S, i, T, j, cfg, symbol, tf, btc)
         if sig:
-            fill = S.candles[i + 1].o                # realistic fill at next open
-            chased = (sig.d * (fill - (sig.entry + sig.d * CHASE_ATR * sig.atr)) > 0
-                      or sig.d * (fill - sig.sl) <= 0)
-            if not chased:                           # the auto-trader skips chased ones; live they
-                shift_entry(sig, fill)               # are still alerted and tracked, keeping the pair
-                sig.traded = True                    # busy, so follow them but leave them out of stats
+            if limit:                                # limit order at the signal price, valid 1 candle:
+                nxt = S.candles[i + 1]               # filled only if the next candle trades through it
+                sig.traded = (nxt.l < sig.entry) if sig.d == 1 else (nxt.h > sig.entry)
+            else:
+                fill = S.candles[i + 1].o            # market order: realistic fill at next open
+                chased = (sig.d * (fill - (sig.entry + sig.d * CHASE_ATR * sig.atr)) > 0
+                          or sig.d * (fill - sig.sl) <= 0)
+                if not chased:                       # the auto-trader skips chased ones; live they
+                    shift_entry(sig, fill)           # are still alerted and tracked, keeping the pair
+                    sig.traded = True                # busy, so follow them but leave them out of stats
             open_sig = sig
     return trades
 
@@ -81,7 +106,10 @@ def stats(trades: list) -> dict:
 def report(cfg: dict) -> None:
     pairs = cfg["pairs"] + [p for p in cfg.get("watch_pairs", []) if p not in cfg["pairs"]]
     print(f"\nBacktest: {cfg['backtest']['bars']} x {cfg['entry_tf']} candles per pair, "
-          f"trend filter {cfg['trend_tf']}, fees {cfg['risk']['fee_pct']}%/side, min score {cfg['rules']['min_score']}")
+          f"trend filter {cfg['trend_tf']}, min score {cfg['rules']['min_score']}, "
+          f"{'limit' if cfg.get('trading', {}).get('limit_entry') else 'market'} entry, fees "
+          + (f"{cfg['risk']['fee_pct']}% taker / {cfg['risk']['maker_fee_pct']}% maker"
+             if cfg['risk'].get('maker_fee_pct') is not None else f"{cfg['risk']['fee_pct']}%/side"))
     with ThreadPoolExecutor(max_workers=6) as pool:
         results = dict(zip(pairs, pool.map(lambda p: _safe(p, cfg), pairs)))
     hdr = f"{'pair':<10}{'trades':>7}{'win%':>7}{'TP1%':>7}{'avg R':>8}{'total R':>9}{'PF':>6}{'maxDD R':>9}"

@@ -24,7 +24,7 @@ from .data import Candle
 from .strategy import Signal
 
 
-def update(sig: Signal, k: Candle, fee_pct: float, max_bars: int, bar_ms: int,
+def update(sig: Signal, k: Candle, fee_pct, max_bars: int, bar_ms: int,
            breakeven_at_r: float | None = None) -> list[dict]:
     """breakeven_at_r: also move the stop to entry once price has gone this many R in our favour
     before TP1 (None = only at TP1, the default rule)."""
@@ -41,15 +41,16 @@ def update(sig: Signal, k: Candle, fee_pct: float, max_bars: int, bar_ms: int,
 
     hit_sl = (k.l <= sig.sl_now) if d == 1 else (k.h >= sig.sl_now)
     if hit_sl:
-        sig.realized_r += sig.remaining * d * (sig.sl_now - sig.entry) / risk
+        rem = sig.remaining
+        sig.realized_r += rem * d * (sig.sl_now - sig.entry) / risk
         sig.remaining = 0.0
         at_entry = sig.tp_hit == 0 and sig.sl_now == sig.entry
         ev.append({"kind": "stop", "after_tp": sig.tp_hit, "price": sig.sl_now, "breakeven": at_entry})
         _close(sig, "stop at breakeven" if at_entry else "stop loss" if sig.tp_hit == 0
-               else f"stop after TP{sig.tp_hit}", k.tc, fee_pct)
+               else f"stop after TP{sig.tp_hit}", k.tc, fee_pct, sig.sl_now, rem)
         return ev
 
-    tp_before, sl_before = sig.tp_hit, sig.sl_now
+    sl_before = sig.sl_now
     while sig.tp_hit < n:
         tp = sig.tps[sig.tp_hit]
         if (k.h > tp) if d == 1 else (k.l < tp):
@@ -73,28 +74,31 @@ def update(sig: Signal, k: Candle, fee_pct: float, max_bars: int, bar_ms: int,
         ev.append({"kind": "breakeven", "price": sig.entry, "new_sl": sig.entry, "at_r": breakeven_at_r})
 
     if sig.sl_now != sl_before and d * (k.c - sig.sl_now) <= 0:      # came back through the moved stop
-        sig.realized_r += sig.remaining * d * (sig.sl_now - sig.entry) / risk
+        rem = sig.remaining
+        sig.realized_r += rem * d * (sig.sl_now - sig.entry) / risk
         sig.remaining = 0.0
         at_entry = sig.tp_hit == 0
         ev.append({"kind": "stop", "after_tp": sig.tp_hit, "price": sig.sl_now, "breakeven": at_entry})
-        _close(sig, "stop at breakeven" if at_entry else f"stop after TP{sig.tp_hit}", k.tc, fee_pct)
+        _close(sig, "stop at breakeven" if at_entry else f"stop after TP{sig.tp_hit}", k.tc, fee_pct, sig.sl_now, rem)
         return ev
 
     if sig.bars >= max_bars:
-        sig.realized_r += sig.remaining * d * (k.c - sig.entry) / risk
+        rem = sig.remaining
+        sig.realized_r += rem * d * (k.c - sig.entry) / risk
         sig.remaining = 0.0
-        _close(sig, "expired", k.tc, fee_pct)
+        _close(sig, "expired", k.tc, fee_pct, k.c, rem)
         ev.append({"kind": "expired", "price": k.c, "bars": sig.bars})
     return ev
 
 
-def close_now(sig: Signal, price: float, t: int, fee_pct: float, reason: str = "closed by you") -> None:
+def close_now(sig: Signal, price: float, t: int, fee_pct, reason: str = "closed by you") -> None:
     """Close whatever is left of the position at `price` (manual exit from the phone)."""
     if sig.status != "open":
         return
-    sig.realized_r += sig.remaining * sig.d * (price - sig.entry) / sig.risk
+    rem = sig.remaining
+    sig.realized_r += rem * sig.d * (price - sig.entry) / sig.risk
     sig.remaining = 0.0
-    _close(sig, reason, t, fee_pct)
+    _close(sig, reason, t, fee_pct, price, rem)
 
 
 def live_r(sig: Signal, price: float) -> float:
@@ -102,7 +106,27 @@ def live_r(sig: Signal, price: float) -> float:
     return sig.realized_r + sig.remaining * sig.d * (price - sig.entry) / sig.risk
 
 
-def _close(sig: Signal, reason: str, t: int, fee_pct: float) -> None:
-    # round-trip taker fees expressed in R
-    sig.realized_r -= 2 * fee_pct / 100 * sig.entry / sig.risk
+def fees_of(cfg: dict):
+    """The fee setting to pass to update() / close_now(): exchange-accurate when the maker fee is
+    configured (take-profits are limit orders = maker; entry, stop, expiry are market = taker),
+    else the old flat fee on every side."""
+    rk = cfg["risk"]
+    if rk.get("maker_fee_pct") is None:
+        return rk["fee_pct"]
+    limit = cfg.get("trading", {}).get("limit_entry")
+    return {"taker": rk["fee_pct"], "maker": rk["maker_fee_pct"],
+            "entry": rk["maker_fee_pct"] if limit else rk["fee_pct"]}
+
+
+def _close(sig: Signal, reason: str, t: int, fee_pct, exit_px: float | None = None, rem: float = 0.0) -> None:
+    """Close and charge fees, in R. fee_pct: a number (that % on entry and on the whole exit) or
+    {'entry', 'maker', 'taker'}: each take-profit slice at the maker fee, what is left at the end
+    (stop, expiry, manual close) at the taker fee."""
+    if isinstance(fee_pct, dict):
+        part = 1.0 / len(sig.tps)
+        cost = (fee_pct["entry"] * sig.entry + fee_pct["maker"] * part * sum(sig.tps[:sig.tp_hit])
+                + fee_pct["taker"] * rem * (exit_px or sig.entry))
+        sig.realized_r -= cost / 100 / sig.risk
+    else:
+        sig.realized_r -= 2 * fee_pct / 100 * sig.entry / sig.risk      # flat round trip
     sig.status, sig.exit_reason, sig.closed_at = "closed", reason, t

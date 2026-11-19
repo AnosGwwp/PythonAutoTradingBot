@@ -32,6 +32,12 @@ max_bars_open = 48         # close a signal at market if no SL/TP after this man
 # breakeven_at_r = 0.5     # optional: stop to entry once +0.5R in profit (default: only at TP1).
                            # /review tests this on history and suggests it only if it clearly helps.
 cooldown_bars = 6          # after a signal closes, wait this long before re-signalling that pair
+# Filters chosen on a year of 1h data across 9 coins: each one improved results in BOTH the older
+# and the newer part of the year (see README, "Strategy research"). Set false / remove to switch off.
+skip_wide_stops = true     # skip if the swing stop is beyond sl_atr_max: a capped stop isn't at support
+min_trend_spread_pct = 1.0 # the 4h EMA50 must be at least 1% away from the EMA200: a clear bigger trend
+btc_confirm = true         # ETH, SOL and other altcoins only trade in the direction of Bitcoin's 4h trend
+max_volume_ratio = 2.5     # skip entry candles with more than 2.5x normal volume (often exhaustion)
 
 [risk]
 # These can also be changed from your phone: /capital /risk /lev  (saved in logs/settings.json,
@@ -43,7 +49,8 @@ leverage = 10              # leverage you set on the exchange (use ISOLATED marg
                            # Lowered per trade automatically if the stop would be too close to liquidation.
 max_margin_pct = 30        # never put more than this % of capital as margin into one trade
 maint_margin_pct = 0.5     # exchange maintenance margin, used to estimate the liquidation price
-fee_pct = 0.05             # taker fee per side, used in backtest results
+fee_pct = 0.055            # Bybit taker fee (market orders: market entry, stop, expiry)
+maker_fee_pct = 0.02       # Bybit maker fee (limit orders: limit entry, take-profits)
 
 [trading]
 # Auto-trading on Bybit. Keys are read from the Windows user variables BYBIT_API_KEY and
@@ -55,6 +62,8 @@ isolated = true            # put the account in isolated margin mode
 trade_watchlist = false    # also auto-trade low-priority (watchlist) pairs?
 max_open_trades = 3        # at most this many bot positions at once
 max_same_direction = 2     # at most this many LONGs (or SHORTs) at once: BTC/ETH/SOL usually move together
+limit_entry = true         # enter with a limit order at the signal price (maker fee, better price), valid
+                           # for one candle; not filled -> skipped. false = market order at once.
 max_daily_loss_pct = 3     # no NEW trades for the rest of the day once today's loss (closed trades as
                            # booked on Bybit + open trades currently losing) reaches this % of capital
 
@@ -79,6 +88,7 @@ headlines = true           # read headlines: which coin, good or bad, how seriou
 headline_every_sec = 180
 headline_max_per_hour = 6  # notable news alerts per hour (major news always gets through)
 bybit_delistings = true    # alert if Bybit announces a delisting of one of your coins
+cryptopanic = false        # CryptoPanic news + community votes: PAID plan only (CRYPTOPANIC_TOKEN in .env)
 ai = true                  # let Claude read the headlines (needs ANTHROPIC_API_KEY; else keyword rules)
 ai_model = "claude-haiku-5-5"   # fast and cheap; "claude-sonnet-5-5" or "claude-opus-5-5" judge more deeply
 block_hours = 4            # after MAJOR news, no new auto-trades AGAINST it on that coin for this long

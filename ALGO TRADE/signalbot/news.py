@@ -26,6 +26,7 @@ import logging
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections import deque
@@ -34,7 +35,8 @@ from datetime import datetime
 from pathlib import Path
 
 from .data import Candle
-from .news_ai import SEVERITY, NewsAnalyst, _similar, coin_patterns  # noqa: F401  (coin_patterns re-exported)
+from .news_ai import SEVERITY, NewsAnalyst, _similar, apply_votes, community
+from .notify import env
 
 log = logging.getLogger("signals")
 
@@ -199,11 +201,92 @@ def concerns(s: dict, coin: str) -> bool:
     return s.get("relevant") and (s.get("scope") == "market" or coin in (s.get("coins") or []))
 
 
+class CryptoPanic:
+    """CryptoPanic: crypto news gathered from many sites, with community votes (bullish, bearish,
+    important) that show how traders read each story. A PAID API plan (cryptopanic.com/developers/api):
+    off unless `[news] cryptopanic = true` and CRYPTOPANIC_TOKEN is set. Their terms ask for a link
+    back to CryptoPanic: every alert built from it links to the story's CryptoPanic page."""
+
+    URLS = ["https://cryptopanic.com/api/developer/v2/posts/", "https://cryptopanic.com/api/v1/posts/"]
+
+    def __init__(self, cfg: dict):
+        n = cfg.get("news", {})
+        on = self.enabled = n.get("cryptopanic", False)
+        self.token = env("CRYPTOPANIC_TOKEN") if on else ""
+        self.urls = [n["cryptopanic_url"]] if n.get("cryptopanic_url") else list(self.URLS)
+        self.error = "" if self.token else ("CRYPTOPANIC_TOKEN is not set" if on else "off in signals.toml")
+        self.paused_until = 0.0
+        self.posts_seen = 0
+
+    @property
+    def active(self) -> bool:
+        return bool(self.token) and time.time() >= self.paused_until
+
+    @property
+    def label(self) -> str:
+        if not self.token:
+            return f"off ({self.error})"
+        return f"paused ({self.error})" if not self.active else "on"
+
+    def _pause(self, seconds: int, why: str) -> list:
+        self.paused_until, self.error = time.time() + seconds, why
+        log.warning("CryptoPanic %s; trying again in %d min", why, seconds // 60)
+        return []
+
+    def fetch(self, coins: list[str]) -> list[dict]:
+        if not self.active:
+            return []
+        query = urllib.parse.urlencode({"auth_token": self.token, "public": "true", "kind": "news",
+                                        **({"currencies": ",".join(coins)} if coins else {})})
+        for url in list(self.urls):
+            try:
+                raw = _get(f"{url}?{query}")
+            except urllib.error.HTTPError as e:
+                if e.code == 404 and len(self.urls) > 1:
+                    self.urls.remove(url)                  # older/newer API version: try the next one
+                    continue
+                if e.code in (401, 403):
+                    return self._pause(3600, f"refused the request (HTTP {e.code}: token rejected, or blocked by Cloudflare)")
+                return self._pause(900 if e.code == 429 else 600, f"HTTP {e.code}")
+            except Exception as e:
+                return self._pause(600, f"unreachable ({type(e).__name__})")
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                return self._pause(1800, "answered with a web page instead of data (Cloudflare check?)")
+            if not isinstance(data, dict) or "results" not in data:
+                return self._pause(1800, f"unexpected reply: {str(data)[:80]}")
+            self.urls, self.error = [url], ""               # remember the endpoint that works
+            items = [self._item(p) for p in data.get("results") or [] if isinstance(p, dict) and p.get("title")]
+            self.posts_seen += len(items)
+            return items
+        return self._pause(3600, "no working API address (404)")
+
+    @staticmethod
+    def _item(p: dict) -> dict:
+        try:
+            t = datetime.fromisoformat(str(p.get("published_at", "")).replace("Z", "+00:00")).timestamp() * 1000
+        except ValueError:
+            t = 0.0
+        src = p.get("source") if isinstance(p.get("source"), dict) else {}
+        coins = [c.get("code") for c in (p.get("currencies") or p.get("instruments") or [])
+                 if isinstance(c, dict) and c.get("code")]
+        cp_url = p.get("url") or (f"https://cryptopanic.com/news/{p['id']}/{p.get('slug', '')}" if p.get("id") else "")
+        summary = html.unescape(re.sub(r"<[^>]+>", " ", str(p.get("description") or "")))
+        return {"title": str(p["title"]).strip(), "link": p.get("original_url") or cp_url, "t": t,
+                "source": f"{src.get('title') or src.get('domain') or 'news'} via CryptoPanic",
+                "summary": " ".join(summary.split())[:300], "cp_id": str(p.get("id") or cp_url or p["title"]),
+                "cp_url": cp_url, "cp_coins": [str(c).upper() for c in coins],
+                "votes": p.get("votes") if isinstance(p.get("votes"), dict) else {}}
+
+
 class Headlines:
     """Fetches the feeds, has each NEW headline assessed (news_ai), keeps the stories."""
 
-    def __init__(self, cfg: dict, seen_path: Path, analyst: NewsAnalyst | None = None):
+    def __init__(self, cfg: dict, seen_path: Path, analyst: NewsAnalyst | None = None,
+                 panic: CryptoPanic | None = None):
         n = cfg.get("news", {})
+        self.panic = panic or CryptoPanic(cfg)
         self.every = n.get("headline_every_sec", 180)
         self.max_per_hour = n.get("headline_max_per_hour", 6)
         self.delist = n.get("bybit_delistings", True)
@@ -230,7 +313,7 @@ class Headlines:
         self.last_new: list[dict] = []           # stories added by the latest poll
         self.next_poll = 0.0
 
-    def _fetch_all(self) -> list[dict]:
+    def _fetch_all(self, coins: list[str] | None = None) -> list[dict]:
         def one(item):
             name, url = item
             try:
@@ -249,25 +332,32 @@ class Headlines:
                                 "t": float(a.get("publishTime") or 0), "source": "Bybit", "delist": True})
             except Exception as e:
                 log.debug("bybit announcements: %s", e)
+        out += self.panic.fetch(coins or [])
         return out
 
     def poll(self, coins: list[str]) -> list[dict]:
-        """Fetch, assess new headlines, store the relevant ones. Returns the stories to alert on
-        (rate-limited; major ones always pass). The first run only learns what exists."""
+        """Fetch, assess new headlines, store the relevant ones, refresh CryptoPanic votes. Returns
+        the stories to alert on (rate-limited; major ones always pass). The first run only learns
+        what exists."""
         if time.time() < self.next_poll:
             return []
         self.next_poll = time.time() + self.every
         now = time.time() * 1000
+        self.last_new, alerts = [], []
+        by_cp = {s["cp_id"]: s for s in self.recent if s.get("cp_id")}
         new = []
-        for it in self._fetch_all():
+        for it in self._fetch_all(coins):
             key = it["link"] or it["title"]
             if key in self.seen:
+                old = by_cp.get(it.get("cp_id"))     # a story we know: only its votes change
+                if old is not None and it.get("votes") != old.get("votes"):
+                    old["votes"] = it["votes"]
+                    self._revote(old, now, alerts)
                 continue
             self.seen[key] = now
             if it["t"] and now - it["t"] > FRESH_MS:
                 continue                                   # old news
             new.append(dict(it, key=key))
-        self.last_new, alerts = [], []
         if new:
             earlier = [s for s in self.recent if s.get("severity", 0) >= 1]
             by_key = {s["key"]: s for s in self.recent if s.get("key")}
@@ -275,18 +365,30 @@ class Headlines:
                 if not a.get("dup"):                       # also catch repeats within this poll
                     a["dup"] = next((s["key"] for s in self.last_new if _similar(it["title"], s["title"])), None)
                 if a.get("dup") in by_key:                 # the same story from another site
-                    by_key[a["dup"]]["sources"] = by_key[a["dup"]].get("sources", 1) + 1
+                    orig = by_key[a["dup"]]
+                    orig["sources"] = orig.get("sources", 1) + 1
+                    if it.get("cp_id") and not orig.get("cp_id"):      # CryptoPanic's copy brings the votes
+                        orig.update(cp_id=it["cp_id"], cp_url=it.get("cp_url", ""), votes=it.get("votes") or {})
+                        by_cp[it["cp_id"]] = orig
+                        self._revote(orig, now, alerts)
                     continue
+                tagged = [c for c in it.get("cp_coins") or [] if c in coins]
+                if tagged and not a.get("coins"):          # CryptoPanic says which coins it concerns
+                    a.update(coins=tagged, relevant=True, scope="coin", severity=max(a.get("severity", 0), 1))
                 if not a.get("relevant"):
                     continue
                 story = {**it, **a, "sources": 1, "seen_at": now}
+                apply_votes(story)
                 self.recent.appendleft(story)
                 by_key[story["key"]] = story
+                if story.get("cp_id"):
+                    by_cp[story["cp_id"]] = story
                 self.last_new.append(story)
                 if story["severity"] >= 2 and not self.first and (not it["t"] or now - it["t"] < ALERT_FRESH_MS):
+                    story["alerted"] = True
                     alerts.append(story)
         if self.first:
-            self.last_new = []                             # nothing is "new" on the very first run
+            self.last_new, alerts = [], []                 # nothing is "new" on the very first run
         self.first = False
         self._save()
         out = []
@@ -296,6 +398,17 @@ class Headlines:
             self.sent.append(now)
             out.append(s)
         return out
+
+    def _revote(self, story: dict, now: float, alerts: list[dict]) -> None:
+        """Votes arrive over minutes. If they turn a story into notable news, act on it now."""
+        before = (story.get("direction"), story.get("severity", 0))
+        apply_votes(story)
+        became = story["severity"] >= 2 and (story["direction"], story["severity"]) != before
+        fresh = not story.get("t") or now - story["t"] < ALERT_FRESH_MS
+        if became and fresh and not story.get("alerted"):
+            story["alerted"] = True
+            alerts.append(story)
+            self.last_new.append(story)                    # open trades react to it too
 
     def _save(self) -> None:
         cut = time.time() * 1000 - 7 * 86_400_000
@@ -314,11 +427,24 @@ def headline_message(s: dict) -> str:
     tags = "  ·  ".join(x for x in (who, f"{DIR_ICON.get(s.get('direction'), '')} {s.get('direction', '')}",
                                     SEVERITY.get(sev, "")) if x.strip())
     lines = [f"{head}  ·  {html.escape(tags)}", html.escape(s["title"])]
-    if s.get("why") and s.get("by") == "ai":
+    if s.get("why"):
         lines.append(f"<i>{html.escape(s['why'])}</i>")
+    votes = votes_line(s)
+    if votes:
+        lines.append(votes)
     src = html.escape(s.get("source", ""))
-    lines.append(f'<a href="{html.escape(s["link"], quote=True)}">{src}</a>' if s.get("link") else src)
+    link = s.get("cp_url") or s.get("link")              # CryptoPanic stories link back to CryptoPanic
+    lines.append(f'<a href="{html.escape(link, quote=True)}">{src}</a>' if link else src)
     return "\n".join(lines)
+
+
+def votes_line(s: dict) -> str:
+    """'👥 CryptoPanic voters: 🟢 12 · 🔴 3 · ⭐ 5 important' once anyone has voted."""
+    c = s.get("community") or (community(s["votes"]) if s.get("votes") else None)
+    if not c or not (c["n"] or c["important"]):
+        return ""
+    return (f"👥 CryptoPanic voters: 🟢 {c['pos']:g} · 🔴 {c['neg']:g}"
+            + (f" · ⭐ {c['important']:g} important" if c["important"] else ""))
 
 
 # ---------------------------------------------------------------- orchestration
@@ -344,6 +470,8 @@ class News:
         line = "📰 News guard: " + (", ".join(parts) if parts else "off")
         if self.headlines:
             line += f"\n🧠 Headlines read by: {html.escape(self.headlines.analyst.label)}"
+            if self.headlines.panic.enabled:
+                line += f"\n👥 CryptoPanic votes: {html.escape(self.headlines.panic.label)}"
         return line
 
     # ---- what the stories mean for one coin
@@ -508,10 +636,13 @@ class News:
                 more = f" +{s['sources'] - 1} sites" if s.get("sources", 1) > 1 else ""
                 lines.append(f"{DIR_ICON.get(s.get('direction'), '')} <b>{SEVERITY.get(s.get('severity'), '')}</b> · "
                              f"{who} · {_ago(now_ms - story_time(s))}{more}\n{html.escape(s['title'])}"
-                             + (f"\n<i>{html.escape(s['why'])}</i>" if s.get("by") == "ai" and s.get("why") else ""))
+                             + (f"\n<i>{html.escape(s['why'])}</i>" if s.get("why") else "")
+                             + (f"\n{votes_line(s)}" if votes_line(s) else ""))
             if not top:
                 lines.append("nothing important (checks every few minutes)")
             a = self.headlines.analyst
             calls, cost = a.cost_today()
             lines.append(f"\n🧠 Read by {html.escape(a.label)}" + (f"  ·  today {calls} requests ≈ ${cost:.3f}" if calls else ""))
+            if self.headlines.panic.enabled:
+                lines.append(f"👥 CryptoPanic votes: {html.escape(self.headlines.panic.label)}")
         return "\n".join(lines)

@@ -161,12 +161,38 @@ class LockFreeScanTests(unittest.TestCase):
             def download(pair, tf, n, src):               # the user sends /close while we download
                 self.assertTrue(lock.acquire(blocking=False))   # downloads must not hold the lock
                 lock.release()
-                st.closed.append(st.open.pop("BTCUSDT"))
+                if "BTCUSDT" in st.open:
+                    st.closed.append(st.open.pop("BTCUSDT"))
                 return [Candle(1, 60_001, 100, 90, 90, 90, 1)]   # would hit the stop
             with mock.patch.object(scanner, "candles", side_effect=download):
                 scan_once(_cfg(t), st, mock.Mock(), lock=lock)
             self.assertEqual(sig.status, "open")                 # not processed twice
             self.assertEqual(st.open, {})
+
+
+class LongDowntimeTests(unittest.TestCase):
+    def test_catch_up_uses_hourly_candles_for_the_part_1m_history_cannot_reach(self):
+        with tempfile.TemporaryDirectory() as t:
+            st = State(Path(t) / "s.json")
+            H = 3_600_000
+            now = int(time.time() * 1000) // 60_000 * 60_000
+            opened = now - 90 * H                                # bot was off for ~4 days
+            sig = Signal("BTCUSDT", "LONG", "1h", opened, 100, 98, [102, 104, 106], 70, ["pullback"], [], 1,
+                         sl_now=98, last_t=opened - 1)
+            st.open["BTCUSDT"] = sig
+            st.last_eval["BTCUSDT"] = now
+            hourly = [Candle(opened + i * H, opened + (i + 1) * H, 100, 100.5, 99.5, 100, 1) for i in range(90)]
+            hourly[10] = Candle(opened + 10 * H, opened + 11 * H, 100, 100.5, 97.0, 98, 1)   # stop hit on day 1
+
+            def get(pair, tf, n, src):
+                if tf == "1h":
+                    return hourly[-n:]
+                return [Candle(now - (n - i) * 60_000, now - (n - i - 1) * 60_000, 100, 100, 100, 100, 1)
+                        for i in range(n)]
+            with mock.patch.object(scanner, "candles", side_effect=get):
+                scan_once(_cfg(t), st, mock.Mock())
+            self.assertEqual(sig.exit_reason, "stop loss")       # not "expired" days later
+            self.assertEqual(sig.closed_at, opened + 11 * H)
 
 
 class ReviewInBackgroundTests(unittest.TestCase):

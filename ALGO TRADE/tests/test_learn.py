@@ -132,6 +132,7 @@ class RuleInScanTests(unittest.TestCase):
             trader = mock.Mock(active=True)
             trader.sync.return_value = []
             trader.audit_stops.return_value = []
+            trader.check_pending.return_value = []
             sent = []
             n = mock.Mock()
             n.signal.side_effect = lambda s, note="": sent.append(note)

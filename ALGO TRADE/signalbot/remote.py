@@ -279,7 +279,7 @@ class Remote:
             closed = list(st.closed)
         now = self._now_prices(sigs)
         risk_amt = rk["account_size"] * rk["risk_pct"] / 100
-        lines = [f"📊 <b>Status</b>  ·  " + ("⏸ <b>PAUSED</b> (open trades still managed)" if paused else "✅ scanning"),
+        lines = ["📊 <b>Status</b>  ·  " + ("⏸ <b>PAUSED</b> (open trades still managed)" if paused else "✅ scanning"),
                  "",
                  f"👀 {self._names(cfg['pairs'])}"
                  + (f"  ·  watchlist {self._names(cfg.get('watch_pairs', []))}" if cfg.get("watch_pairs") else "")
@@ -291,8 +291,11 @@ class Remote:
             p = now.get(s.symbol)
             pnl = (f"<b>{money(tracker.live_r(s, p) * r_usd(s, cfg))}</b> ({tracker.live_r(s, p):+.2f}R)"
                    if p else "price unavailable")
-            lines.append(f"{'🟢' if s.d == 1 else '🔴'} {coin(s.symbol)} {s.side.lower()}  {pnl}  ·  stop {stop_label(s).split(' · ')[0]}"
-                         + ("" if s.traded else "  ·  alert only"))
+            if s.pending:
+                pnl = f"⏳ limit entry at {px(s.pending['price'])} waiting to fill"
+            lines.append(f"{'🟢' if s.d == 1 else '🔴'} {coin(s.symbol)} {s.side.lower()}  {pnl}"
+                         + ("" if s.pending else f"  ·  stop {stop_label(s).split(' · ')[0]}")
+                         + ("" if s.traded or s.pending else "  ·  alert only"))
         if not sigs:
             lines.append("none")
         lines += ["", "<b>Closed trades</b>"]
@@ -329,8 +332,13 @@ class Remote:
             p = now.get(s.symbol)
             opened = time.strftime("%d %b %H:%M", time.localtime(s.time / 1000))
             block = [f"\n{'🟢' if s.d == 1 else '🔴'} <b>{coin(s.symbol)} {s.side}</b>  ·  {s.tf}  ·  since {opened}"
-                     + ("  ·  🤖 on Bybit" if s.traded else "  ·  alert only")]
-            if p:
+                     + ("  ·  🤖 on Bybit" if s.traded else "  ·  ⏳ entry order on Bybit" if s.pending
+                        else "  ·  alert only")]
+            if s.pending:
+                until = time.strftime("%H:%M", time.localtime(s.pending["until"] / 1000))
+                block.append(f"⏳ Limit {'buy' if s.d == 1 else 'sell'} at {px(s.pending['price'])} waiting to fill "
+                             f"(until {until})" + (f"  ·  now {px(p)}, {away(p, s.pending['price'])}" if p else ""))
+            elif p:
                 lr = tracker.live_r(s, p)
                 block.append(f"P&amp;L <b>{money(lr * r_usd(s, cfg))}</b> ({lr:+.2f}R)  ·  now {px(p)}, entry {px(s.entry)}")
             else:
@@ -517,6 +525,8 @@ class Remote:
             if sig is None:
                 return f"{coin(sym)} already closed."
             extra = ""
+            if sig.pending and self.trader:
+                extra = "\n" + self.trader.cancel_pending(sig, "you closed the signal")
             if sig.traded and self.trader:
                 try:
                     size = self.trader.flatten(sig)
@@ -526,7 +536,7 @@ class Remote:
                     return (f"❌ Bybit refused to close {coin(sym)}: {html.escape(str(e))}\n"
                             "Close it in the Bybit app. The trade is still tracked here.")
             t = int(time.time() * 1000)
-            tracker.close_now(sig, now, t, self.cfg["risk"]["fee_pct"])
+            tracker.close_now(sig, now, t, tracker.fees_of(self.cfg))
             sig.events.append(f"{time.strftime('%m-%d %H:%M')} closed by you (/close) @ {now:.8g}")
             self.st.closed.append(self.st.open.pop(sym))
             learn.on_closed(self.cfg, self.st, sig)

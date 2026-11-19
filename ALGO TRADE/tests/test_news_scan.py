@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from signalbot import data, news, scanner
+from signalbot import data, news, news_ai, scanner
 from signalbot.data import Candle, CandleCache
 from signalbot.scanner import State, scan_once
 from signalbot.strategy import Signal
@@ -31,7 +31,7 @@ class NewsTest(unittest.TestCase):
         self.assertEqual(items[1]["t"], 0)
 
     def test_coin_patterns(self):
-        p = news.coin_patterns(["BTC", "SOL"])
+        p = news_ai.coin_patterns(["BTC", "SOL"])
         self.assertTrue(p["BTC"].search("Bitcoin plunges"))
         self.assertTrue(p["SOL"].search("SOL ecosystem grows"))
         self.assertTrue(p["SOL"].search("Solana outage"))
@@ -39,7 +39,7 @@ class NewsTest(unittest.TestCase):
         self.assertFalse(p["SOL"].search("the sol of it"))       # lowercase ticker isn't a match
 
     def test_delisting_names_the_contract(self):
-        p = news.coin_patterns(["SOL", "ARB"])
+        p = news_ai.coin_patterns(["SOL", "ARB"])
         self.assertTrue(p["SOL"].search("Bybit Will Delist the SOLUSDT Perpetual Contract"))
         self.assertTrue(p["ARB"].search("Delisting of ARBUSDT, XYZUSDT Perpetual Contracts"))
         self.assertTrue(p["ARB"].search("Delisting of ARB/USDT Spot Trading Pair"))
@@ -171,6 +171,7 @@ class ScanTest(unittest.TestCase):
         trader = mock.Mock(active=True)
         trader.sync.return_value = []
         trader.audit_stops.return_value = []
+        trader.check_pending.return_value = []
         blocker = mock.Mock(**{"alignment.return_value": "none", "context.return_value": ""})
         blocker.block_reason.return_value = "high-impact news: USD CPI"
         res, n = self.run_scan(trader, blocker)
@@ -185,6 +186,7 @@ class ScanTest(unittest.TestCase):
         trader.open.return_value = "🤖 traded"
         trader.sync.return_value = []
         trader.audit_stops.return_value = []
+        trader.check_pending.return_value = []
         clear = mock.Mock(**{"alignment.return_value": "against",
                              "context.return_value": "📰 News on BTC (12 h): bearish"})
         clear.block_reason.return_value = ""

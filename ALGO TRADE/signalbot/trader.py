@@ -20,6 +20,7 @@ from dataclasses import replace
 from decimal import Decimal
 
 from .bybit import UNCERTAIN, Bybit, BybitError, floor_step, round_tick
+from .data import TF_MS
 from .notify import coin, env, px, r_usd, sizing
 from .strategy import CHASE_ATR, Signal, shift_entry
 
@@ -108,9 +109,9 @@ class Trader:
         t = self.t
         if sig.symbol in self.cfg.get("watch_pairs", []) and not t.get("trade_watchlist", False):
             return "🤖 Not auto-traded (watchlist pair)."
-        if sum(s.traded for s in open_sigs) >= t.get("max_open_trades", 3):
+        if sum(s.traded or bool(s.pending) for s in open_sigs) >= t.get("max_open_trades", 3):
             return "🤖 Not auto-traded: max open trades reached."
-        same = sum(s.traded and s.side == sig.side for s in open_sigs)
+        same = sum((s.traded or bool(s.pending)) and s.side == sig.side for s in open_sigs)
         if same >= t.get("max_same_direction", 2):
             return (f"🤖 Not auto-traded: {same} {sig.side} trade(s) already open. Coins mostly move "
                     "together, so another one would just double the same bet.")
@@ -137,24 +138,37 @@ class Trader:
             return f"🤖 Not auto-traded: price {px(now)} already ran past {px(chase)}."
         if sig.d * (now - sig.sl) <= 0:
             return "🤖 Not auto-traded: price is already beyond the stop."
+        limit = bool(self.t.get("limit_entry"))
         wallet = ex.wallet()
         capital = self.cfg["risk"]["account_size"]
         if 0 < wallet["equity"] < capital:         # after losses: risk % of what is really there
             capital = wallet["equity"]
-        plan = replace(sig)                        # size on a copy anchored at the current price;
-        shift_entry(plan, now)                     # the alert keeps its levels if we skip
+        plan = replace(sig)                        # size on a copy anchored at the entry price;
+        if not limit:                              # the alert keeps its levels if we skip
+            shift_entry(plan, now)
         s = sizing(plan, {**self.cfg, "risk": {**self.cfg["risk"], "account_size": capital}})
         lev = max(1, min(s["lev"], int(info["max_lev"])))
         qty = floor_step(min(s["qty"], info["max_mkt_qty"]), info["qty_step"])
-        if float(qty) < info["min_qty"] or float(qty) * now < info["min_notional"]:
+        if float(qty) < info["min_qty"] or float(qty) * plan.entry < info["min_notional"]:
             return f"🤖 Not auto-traded: size {qty} {coin(sym)} is below Bybit's minimum."
-        margin = float(qty) * now / lev
+        margin = float(qty) * plan.entry / lev
         avail = wallet["available"]
         if avail < margin * 1.05:
             return f"🤖 Not auto-traded: needs ${margin:,.0f} margin, only ${avail:,.0f} available."
 
         ex.set_leverage(sym, lev)
         attached_sl = round_tick(plan.sl, info["tick"])
+        if limit:
+            price_ = round_tick(sig.entry, info["tick"])
+            link = ex.entry_limit(sym, "Buy" if long else "Sell", qty, price_, attached_sl)
+            until = int(time.time() * 1000) + TF_MS[sig.tf]
+            sig.pending = {"link": link, "price": float(price_), "qty": float(qty), "lev": lev,
+                           "sl": float(attached_sl), "until": until, "capital": capital}
+            return (f"🤖 <b>Limit order on {self.label}</b>: {'buy' if long else 'sell'} {qty} {coin(sym)} at "
+                    f"<b>{px(float(price_))}</b> with the stop attached, valid until "
+                    f"{time.strftime('%H:%M', time.localtime(until / 1000))}.\n"
+                    f"      Cheaper fee and a better price than buying at market. If price doesn't come back to "
+                    f"it, the trade is skipped.")
         try:
             ex.market(sym, "Buy" if long else "Sell", qty, sl=attached_sl)
         except BybitError as e:
@@ -169,7 +183,13 @@ class Trader:
             time.sleep(0.4)
         if not pos:
             return "⚠️ Order not confirmed and no position on Bybit, so nothing was opened."
+        return self._after_fill(sig, pos, info, lev, attached_sl, capital)
+
+    def _after_fill(self, sig: Signal, pos: dict, info: dict, lev: int, attached_sl, capital: float) -> str:
+        """The entry filled: re-anchor the levels to the real fill, place the take-profits."""
+        ex, sym, long = self.ex, sig.symbol, sig.d == 1
         sig.traded, sig.qty, sig.traded_at = True, pos["size"], int(time.time() * 1000)
+        sig.pending = {}
         shift_entry(sig, pos["avg"])
         # track the exact tick-rounded prices the orders sit at on Bybit
         sig.sl = sig.sl_now = float(round_tick(sig.sl, info["tick"]))
@@ -179,7 +199,7 @@ class Trader:
         if capital < self.cfg["risk"]["account_size"]:
             problems.append(f"sized from your Bybit equity ${capital:,.0f}, which is below the "
                             f"${self.cfg['risk']['account_size']:,.0f} capital setting")
-        if round_tick(sig.sl, info["tick"]) != attached_sl:       # filled away from the planned price
+        if round_tick(sig.sl, info["tick"]) != Decimal(str(attached_sl)):     # filled away from the plan
             try:
                 ex.set_sl(sym, round_tick(sig.sl, info["tick"]))
             except BybitError as e:
@@ -192,6 +212,61 @@ class Trader:
         if problems:
             msg += "\n⚠️ " + html.escape("; ".join(problems))
         return msg
+
+    # ---------------------------------------------------------------- limit entries waiting for a fill
+    def check_pending(self, open_sigs: list[Signal]) -> list[tuple[Signal, str]]:
+        """Each poll: did a waiting limit entry fill? Filled -> take-profits go on, the bot manages it.
+        Expired unfilled -> cancelled, the signal stays alert-only. Price already reached TP1 (or the
+        signal closed) -> cancelled: the bot doesn't buy after the move is over."""
+        out = []
+        if self.ex is None:
+            return out
+        now = int(time.time() * 1000)
+        for s in open_sigs:
+            p = s.pending
+            if not p:
+                continue
+            try:
+                if s.status != "open" or s.tp_hit > 0:
+                    out.append((s, self.cancel_pending(s, "price reached the first target before the entry "
+                                                          "filled, so the bot doesn't chase it")))
+                    continue
+                st = self.ex.order_status(s.symbol, p["link"]) or {}
+                filled = float(st.get("filled") or 0)
+                done = st.get("status") == "Filled" or filled >= p["qty"] * 0.999
+                if not done and now < p["until"]:
+                    continue                                    # still waiting
+                if not done:
+                    self.ex.cancel_order(s.symbol, p["link"])
+                pos = self.ex.position(s.symbol)
+                if pos:                                         # fully or partly filled
+                    info = self.ex.instrument(s.symbol)
+                    note = "" if done else f" (partly filled: {pos['size']:g} of {p['qty']:g}; the rest was cancelled)"
+                    out.append((s, f"✅ <b>{coin(s.symbol)} {s.side.lower()} entry filled</b>{note}\n"
+                                   + self._after_fill(s, pos, info, p["lev"], p["sl"], p.get("capital", 0) or
+                                                     self.cfg["risk"]["account_size"])))
+                else:
+                    s.pending = {}
+                    out.append((s, f"⌛ <b>{coin(s.symbol)} {s.side.lower()}</b>: the limit order at {px(p['price'])} "
+                                   "didn't fill in time and was cancelled. The trade is skipped; the signal stays "
+                                   "tracked as an alert."))
+            except BybitError as e:
+                log.warning("pending entry %s: %s", s.symbol, e)
+        return out
+
+    def cancel_pending(self, sig: Signal, why: str = "") -> str:
+        p, sig.pending = sig.pending, {}
+        if not p or self.ex is None:
+            return ""
+        try:
+            self.ex.cancel_order(sig.symbol, p["link"])
+        except BybitError as e:
+            log.warning("cancel pending %s: %s", sig.symbol, e)
+        pos = self.ex.position(sig.symbol)
+        if pos:                                         # it filled just before the cancel: close it
+            self.ex.market(sig.symbol, "Sell" if pos["side"] == "Buy" else "Buy", Decimal(str(pos["size"])), reduce=True)
+        return (f"🚫 <b>{coin(sig.symbol)} {sig.side.lower()}</b>: limit entry at {px(p['price'])} cancelled"
+                + (f": {why}." if why else "."))
 
     def _place_tps(self, sig: Signal, info: dict, problems: list) -> int:
         ex, sym = self.ex, sig.symbol

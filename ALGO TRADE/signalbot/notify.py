@@ -200,12 +200,18 @@ def signal_message(sig: Signal, cfg: dict, note: str = "") -> str:
                      + (f"  <i>(leverage lowered from {s['want']}x to keep it past the stop)</i>"
                         if s["lev"] < s["want"] else ""))
     n = len(sig.tps)
+    manage = (f"Close 1/{n} at each TP; after TP1 move the stop to entry." if n > 1 else "Close all at TP1.")
     if sig.traded:
         lines.append("🤖 <i>The bot manages it: stop to entry after TP1, to TP1 after TP2.</i>")
+    elif sig.pending:
+        lines.append("⏳ <i>Waiting for the limit order to fill. Once it does, the bot manages the trade.</i>")
+    elif cfg.get("trading", {}).get("limit_entry"):
+        lines.append(f"👉 <i>Place a limit {'buy' if long else 'sell'} at {px(sig.entry)} (cheaper fee, better "
+                     f"price) and cancel it if it hasn't filled within one {sig.tf} candle. {manage} "
+                     f"Signal at {when}.</i>")
     else:
         lines.append(f"👉 <i>{'Buy' if long else 'Sell'} now, not {'above' if long else 'below'} {px(chase)}. "
-                     + (f"Close 1/{n} at each TP; after TP1 move the stop to entry." if n > 1 else "Close all at TP1.")
-                     + f" Signal at {when}.</i>")
+                     + manage + f" Signal at {when}.</i>")
     lines.append("<blockquote expandable>💡 Why\n" + "\n".join(f"• {html.escape(r)}" for r in sig.reasons)
                  + "</blockquote>")
     return "\n".join(lines)

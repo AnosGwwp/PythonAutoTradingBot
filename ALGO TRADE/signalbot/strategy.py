@@ -71,6 +71,7 @@ class Signal:
     traded: bool = False      # auto-traded on the exchange
     qty: float = 0.0          # filled size on the exchange
     traded_at: int = 0        # ms
+    pending: dict = field(default_factory=dict)   # limit entry waiting for a fill (link, price, until...)
     # --- for learning (see learn.py) ---
     features: dict = field(default_factory=dict)   # indicator values on the signal candle
     mfe_r: float = 0.0        # best move in our favour while open, in R
@@ -115,7 +116,9 @@ def htf_bias(T: Trend, j: int) -> int:
     return 0
 
 
-def evaluate(S: Series, i: int, T: Trend, j: int, cfg: dict, symbol: str, tf: str) -> Signal | None:
+def evaluate(S: Series, i: int, T: Trend, j: int, cfg: dict, symbol: str, tf: str,
+             btc_bias: int | None = None) -> Signal | None:
+    """btc_bias: Bitcoin's own higher-timeframe trend (+1/-1/0) for the `btc_confirm` filter."""
     r = cfg["rules"]
     lb = r["breakout_lookback"]
     if i < max(210, lb + 2) or j < 0:
@@ -126,10 +129,17 @@ def evaluate(S: Series, i: int, T: Trend, j: int, cfg: dict, symbol: str, tf: st
     d = htf_bias(T, j)
     if d == 0:
         return None
+    # --- filters chosen on a year of data, 9 coins, better in both halves (see README, Strategy) ---
+    if r.get("btc_confirm") and btc_bias is not None and not symbol.startswith("BTC") and btc_bias != d:
+        return None                      # altcoins rarely trend against Bitcoin
+    if T.e50[j] and abs(T.e50[j] / T.e200[j] - 1) * 100 < r.get("min_trend_spread_pct", 0):
+        return None                      # the bigger trend isn't clearly established
 
     c, o, h, l = S.c, S.o, S.h, S.l
     a, rs, ax = S.atr[i], S.rsi[i], S.adx[i]
     vol_ratio = S.v[i] / S.vsma[i - 1] if S.vsma[i - 1] > 0 else 0.0
+    if vol_ratio >= r.get("max_volume_ratio", float("inf")):
+        return None                      # a huge volume spike on the entry candle is often exhaustion
     setups, reasons = [], []
 
     # ---------- pullback ----------
@@ -188,6 +198,8 @@ def evaluate(S: Series, i: int, T: Trend, j: int, cfg: dict, symbol: str, tf: st
     swing = (min(l[i - r["swing_lookback"] + 1:i + 1]) - 0.1 * a if d == 1
              else max(h[i - r["swing_lookback"] + 1:i + 1]) + 0.1 * a)
     dist = abs(c[i] - swing)
+    if r.get("skip_wide_stops") and dist > r["sl_atr_max"] * a:
+        return None                      # the real swing stop is too far: a capped stop isn't at support
     dist = min(max(dist, r["sl_atr_min"] * a), r["sl_atr_max"] * a)
     entry = c[i]
     sl = entry - d * dist
@@ -200,7 +212,9 @@ def evaluate(S: Series, i: int, T: Trend, j: int, cfg: dict, symbol: str, tf: st
                 "htf_spread_pct": round(htf_spread * 100, 3),
                 "stretch_atr": round(abs(c[i] - S.e20[i]) / a, 3),     # distance from EMA20
                 "stop_atr": round(dist / a, 3), "atr_pct": round(a / entry * 100, 3),
-                "hour_utc": time.gmtime(S.candles[i].tc / 1000).tm_hour}
+                "hour_utc": time.gmtime(S.candles[i].tc / 1000).tm_hour,
+                "adx_slope": round(ax - S.adx[i - 3], 2),                 # trend strength building or fading
+                "close_pos": round(((c[i] - l[i]) / rng if d == 1 else (h[i] - c[i]) / rng) if rng > 0 else 0.5, 3)}
     return Signal(symbol, "LONG" if d == 1 else "SHORT", tf, S.candles[i].tc, entry, sl, tps,
                   score, setups, reasons, a, sl_now=sl, last_t=S.candles[i].t, features=features)
 

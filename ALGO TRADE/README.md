@@ -103,9 +103,29 @@ headline:
   - how serious it is: noise, minor, notable or major
   - whether it repeats a story already seen on another site (counted once, with the number of sites)
 
-  **Claude Haiku 5.5** reads the headlines when `ANTHROPIC_API_KEY` is set, which costs roughly
-  $1 a month. Without a key, or if the API is down, keyword rules give the same kind of answer,
-  less precisely. `/news` shows which one is in use, and today's AI cost.
+  Three readers, all optional except the first:
+  - **Word list, free and always on** ([signalbot/lexicon.py](signalbot/lexicon.py)): over 500
+    crypto phrases, each with a direction and strength. It understands:
+    - negation: "denies hack" and "no evidence of exploit" are reassuring
+    - guesses and opinion: "could", "price prediction" and analytics-firm commentary are minor
+    - aftermath: sentencing and trials are minor
+    - amounts: a $300K exploit isn't major, a $150M one is
+    - recoveries: "funds returned" and "withdrawals resume" are good news
+    - names: Saylor, MicroStrategy and IBIT mean BTC; Vitalik and Lido mean ETH; Jupiter and
+      pump.fun mean SOL
+
+    Every rules verdict names the words it found.
+  - **CryptoPanic, paid plan, off by default.** To use it, set `[news] cryptopanic = true` and
+    put the key in `CRYPTOPANIC_TOKEN`. It adds more news sources, plus how traders vote on each
+    story.
+    - Votes are re-checked as they come in.
+    - 5+ votes can set a story's direction.
+    - 5+ "important" votes can raise it to notable, but never to major. Closing trades still needs
+      the content itself to say major.
+    - Alerts show the votes and link back to CryptoPanic, as its terms require.
+  - **Claude Haiku 5.5, paid** (`ANTHROPIC_API_KEY`, roughly $1 a month): reads meaning best.
+
+  `/news` and `./bot check` show which readers are active.
 
 How news affects trading. The bot never opens a trade because of news.
 - **Major news** (hack, delisting, ban, ETF decision, surprise Fed move): no new auto-trades
@@ -221,19 +241,43 @@ full history is in `logs/signals.csv`.
 2. Set the environment variables `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
 3. Set `telegram = true` in the config.
 
-**Honest backtest results** (Nov 2026, 3000 × 1h candles over 6 pairs, fees included):
+### Strategy research (Nov 2026)
 
-| Configuration | Trades | Win % | Avg R | Older half | Newer half |
-| --- | --- | --- | --- | --- | --- |
-| 1h / 4h trend (default) | 331 | 53 | 0.00 | −0.23 | +0.22 |
-| 1h / 4h, min score 70 | 267 | 55 | +0.02 | −0.23 | +0.27 |
-| 4h / 1d trend | 201 | 53 | +0.02 | +0.12 | −0.09 |
-| 15m / 1h trend | 617 | 51 | −0.07 | −0.11 | −0.03 |
+**Test setup:**
+- **Data:** one year of 1h candles on 9 coins: BTC, ETH and SOL, plus BNB, XRP, DOGE, ADA, AVAX
+  and LINK as extra out-of-sample checks.
+- **Fees:** Bybit's real fees.
+- **Acceptance rule:** a change was kept only if it improved both the first 60% of the year and the
+  last 40%, and helped on most coins.
 
-The rules are disciplined, but they have **no proven edge**. Results flip between the two
-halves of the data, so performance depends on market conditions. Avoid 15m. Use the backtest
-on your own pairs and the live track record (`status`) before risking money. Treat the scanner
-as a filter and a tool for risk discipline, not a money printer.
+| Min strength 60 | Trades | Avg R | First 60% | Last 40% | Coins positive | Worst drawdown |
+| --- | --- | --- | --- | --- | --- | --- |
+| Old rules, market entry | 1,395 | −0.033 | −0.018 | −0.056 | 4/9 | 105R |
+| + 4 filters | 1,008 | −0.015 | −0.007 | −0.029 | 5/9 | 63R |
+| **+ limit entry (now the default)** | 988 | **+0.013** | +0.024 | −0.008 | 5/9 | **52R** |
+| …BTC, ETH, SOL only | 353 | **+0.029** | +0.027 | **+0.034** | 2/3 | 22R |
+
+**What changed and why:**
+- **Fees decided everything.** Before fees the rules make +0.05R per trade. A 0.1% round trip
+  costs about 0.075R, because the median stop is only 1.3% away.
+- **Limit entries** (`trading.limit_entry`) use the maker fee and enter at the signal price,
+  which is worth about +0.03R per trade. 98% of them filled within one candle.
+- **The 4 filters** (`[rules]`, all on):
+  - skip trades whose real stop is wider than the cap
+  - require a clear 4h trend (EMA50 at least 1% from EMA200)
+  - altcoins only trade in Bitcoin's direction
+  - skip volume spikes over 2.5×
+
+  Together they halve the losses and the drawdown.
+
+**Rejected,** because they made things worse in at least one half: 4h chart, shorter or longer
+time stops, earlier breakeven, tighter or wider targets, ADX rising, session filters, min
+strength 70+.
+
+**Honest verdict:** the edge is thin. It is about breakeven-to-small-positive, and it is positive
+on your 3 coins in both halves. Most of the improvement is cutting costs and bad trades. Keep
+min strength at **60**: with the new rules, 70 is worse. Run `python signals.py backtest` and
+`/review` regularly, and judge the bot on its live record before using real money.
 
 ---
 

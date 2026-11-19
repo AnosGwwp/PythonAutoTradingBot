@@ -29,7 +29,7 @@ from .data import TF_MS, CandleCache, DataError, candles, price
 from .news import SEVERITY, News
 from .notify import Notifier, coin, event_text, format_signal, money, plain, px, r_usd, sizing
 from .remote import KEYBOARD, Remote
-from .strategy import Signal, evaluate, prepare, prepare_trend, trend_index
+from .strategy import Signal, evaluate, htf_bias, prepare, prepare_trend, trend_index
 from .trader import Trader
 
 log = logging.getLogger("signals")
@@ -92,7 +92,14 @@ def _evaluate_pair(pair: str, cfg: dict, cache: CandleCache | None) -> tuple[str
     T = prepare_trend(get(pair, cfg["trend_tf"], HISTORY, src))
     i = len(S.candles) - 1
     j = trend_index(T, S.candles[i].tc)
-    return pair, evaluate(S, i, T, j, cfg, pair, tf), S.candles[i].tc
+    btc = None
+    if cfg["rules"].get("btc_confirm") and not pair.startswith("BTC"):
+        try:                                     # Bitcoin's own trend (cached, so no extra download)
+            BT = prepare_trend(get("BTCUSDT", cfg["trend_tf"], HISTORY, src))
+            btc = htf_bias(BT, trend_index(BT, S.candles[i].tc))
+        except DataError as e:
+            log.warning("no Bitcoin trend for the BTC filter (%s); %s is checked without it", e, pair)
+    return pair, evaluate(S, i, T, j, cfg, pair, tf, btc), S.candles[i].tc
 
 
 def all_pairs(cfg: dict) -> list[str]:
@@ -121,10 +128,18 @@ def scan_once(cfg: dict, st: State, notifier: Notifier, force: bool = False, tra
 
     # ---- downloads, no lock ----
     fetched: dict[str, list] = {}
-    for pair, _, last_t in tracked:              # 1m candles, shared with the shock guard via the cache
+    for pair, sig, last_t in tracked:            # 1m candles, shared with the shock guard via the cache
         try:
-            mins = max(5, min(3000, (now - last_t) // 60_000 + 2))
-            fetched[pair] = get(pair, "1m", int(mins), src)
+            gap_min = (now - last_t) // 60_000
+            coarse = []
+            if gap_min > 2900:                   # bot was off for days: 1m history doesn't reach back,
+                tf_ms = TF_MS[sig.tf]            # so catch up on the trade's own timeframe first
+                coarse = [k for k in get(pair, sig.tf, int(min(1000, gap_min * 60_000 // tf_ms + 2)), src)
+                          if k.t > last_t]
+            fine = get(pair, "1m", int(max(5, min(3000, gap_min + 2))), src)
+            if coarse:
+                fine = [k for k in fine if k.t >= coarse[-1].tc]
+            fetched[pair] = coarse + fine
             res.data_ok += 1
         except DataError as e:
             res.data_err += 1
@@ -148,22 +163,28 @@ def scan_once(cfg: dict, st: State, notifier: Notifier, force: bool = False, tra
             if st.open.get(pair) is not sig or pair not in fetched:
                 continue                         # closed from the phone meanwhile, or no data
             for k in fetched[pair]:
-                for ev in tracker.update(sig, k, cfg["risk"]["fee_pct"], r["max_bars_open"], TF_MS[sig.tf],
+                for ev in tracker.update(sig, k, tracker.fees_of(cfg), r["max_bars_open"], TF_MS[sig.tf],
                                          r.get("breakeven_at_r")):
                     note = trader.on_event(sig, ev) if trader else ""
-                    log_event(sig, event_text(ev) + (f" | {plain(note)}" if note else ""))
+                    log_event(sig, event_text(ev) + (f" | {plain(note)}" if note else ""), k.tc)
                     notifier.event(sig, ev, note)
                 if sig.status == "closed":
-                    close_trade(cfg, st, sig, now)
+                    close_trade(cfg, st, sig, now, trader, notifier)
                     break
+
+        # 1a. limit entries waiting on Bybit: filled, expired, or no longer wanted?
+        if trader:
+            for sig, msg in trader.check_pending(list(st.open.values())):
+                log_event(sig, plain(msg).splitlines()[0])
+                (notifier.alert if "filled" in msg else notifier.info)(msg)
 
         # 1b. trades you closed yourself in the Bybit app (also moves stops after TP fills)
         if trader:
-            for sig, price in trader.sync(list(st.open.values())):
-                tracker.close_now(sig, price, now, cfg["risk"]["fee_pct"], "closed on Bybit")
-                log_event(sig, f"closed on Bybit @ {price:.8g}")
+            for sig, exit_px in trader.sync(list(st.open.values())):
+                tracker.close_now(sig, exit_px, now, tracker.fees_of(cfg), "closed on Bybit")
+                log_event(sig, f"closed on Bybit @ {exit_px:.8g}")
                 close_trade(cfg, st, sig, now)
-                notifier.event(sig, {"kind": "closed", "price": price, "why": "closed on Bybit"})
+                notifier.event(sig, {"kind": "closed", "price": exit_px, "why": "closed on Bybit"})
             # 1c. is every stop on Bybit where it should be? (repairs missing / looser stops)
             for sig, msg in trader.audit_stops(list(st.open.values()), trader.last_positions):
                 log_event(sig, plain(msg))
@@ -218,13 +239,21 @@ def scan_once(cfg: dict, st: State, notifier: Notifier, force: bool = False, tra
     return res
 
 
-def log_event(sig: Signal, text: str) -> None:
-    """Timeline of what happened to a trade, kept with it and in the journal."""
-    sig.events.append(f"{time.strftime('%m-%d %H:%M')} {text}")
+def log_event(sig: Signal, text: str, at_ms: int | None = None) -> None:
+    """Timeline of what happened to a trade, kept with it and in the journal. `at_ms` is when it
+    happened (the candle's time); after downtime that is earlier than now."""
+    when = time.localtime(at_ms / 1000) if at_ms else time.localtime()
+    sig.events.append(f"{time.strftime('%m-%d %H:%M', when)} {text}")
 
 
-def close_trade(cfg: dict, st: State, sig: Signal, now: int) -> None:
-    """Move a closed signal from open to closed: cooldown, journal, Bybit P&L look-up."""
+def close_trade(cfg: dict, st: State, sig: Signal, now: int, trader: Trader | None = None,
+                notifier: Notifier | None = None) -> None:
+    """Move a closed signal from open to closed: cooldown, journal, Bybit P&L look-up. A limit entry
+    still waiting on Bybit is cancelled: the signal it belonged to is over."""
+    if sig.pending and trader:
+        msg = trader.cancel_pending(sig, "the signal ended before the entry filled")
+        if msg and notifier:
+            notifier.info(msg)
     if st.open.get(sig.symbol) is sig:
         st.open.pop(sig.symbol)
     st.closed.append(sig)
@@ -257,7 +286,7 @@ def react_to_news(actions: list[dict], cfg: dict, st: State, trader: Trader | No
                     notifier.alert(f"⚠️ <b>Major bad news for your {name}</b>\n{head}\n"
                                    f"Bybit refused to close it ({html.escape(str(e))}). Close it in the app.")
                     continue
-            tracker.close_now(sig, price_now, now, cfg["risk"]["fee_pct"], "closed: major bad news")
+            tracker.close_now(sig, price_now, now, tracker.fees_of(cfg), "closed: major bad news")
             log_event(sig, f"closed @ {price_now:.8g}: major news against the trade: {s['title'][:80]}")
             close_trade(cfg, st, sig, now)
             notifier.event(sig, {"kind": "closed", "price": price_now, "why": "major news against the trade"},

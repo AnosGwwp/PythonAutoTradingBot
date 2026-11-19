@@ -127,6 +127,20 @@ def run(cfg: dict) -> int:
         return OK, (f"{a.label} answered: {r['direction']}, severity {r['severity']} "
                     f"(test cost ≈ ${a.cost_today()[1]:.4f})")
     check("News AI", news_ai, critical=False)
+
+    def cryptopanic():
+        from .news import CryptoPanic
+        cp = CryptoPanic(cfg)
+        if not cp.token:
+            return WARN, f"{cp.label}. Paid plan at cryptopanic.com/developers/api -> CRYPTOPANIC_TOKEN in .env"
+        posts = cp.fetch(["BTC", "ETH", "SOL"])
+        if not posts:
+            return WARN, f"no posts: {cp.error or 'empty reply'}"
+        voted = sum(1 for p in posts if community(p["votes"])["n"] or p["votes"].get("important"))
+        return OK, f"{len(posts)} posts via {cp.urls[0].split('/api/')[1]}, {voted} with votes"
+    from .news_ai import community
+    if cfg.get("news", {}).get("cryptopanic", False):          # paid service: only checked when switched on
+        check("CryptoPanic", cryptopanic, critical=False)
     check("News feed", feed(FEEDS["CoinDesk"], "CoinDesk"), critical=False)
 
     data_ok = any(n in ("Binance data", "Bybit data") and lvl == OK for n, lvl, _, _ in results)

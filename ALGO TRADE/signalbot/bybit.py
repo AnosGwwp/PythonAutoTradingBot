@@ -184,6 +184,33 @@ class Bybit:
             "price": str(price), "timeInForce": "GTC", "positionIdx": 0, "reduceOnly": reduce,
             "orderLinkId": self._link()}).get("orderId", "")
 
+    def entry_limit(self, symbol: str, side: str, qty: Decimal, price: Decimal, sl: Decimal) -> str:
+        """Opening limit order (GTC) with the stop-loss attached for when it fills. Returns its
+        orderLinkId. If price is already through the limit, it fills at once (at that better price)."""
+        link = self._link()
+        self.post("/v5/order/create", {
+            "category": "linear", "symbol": symbol, "side": side, "orderType": "Limit", "qty": str(qty),
+            "price": str(price), "timeInForce": "GTC", "positionIdx": 0, "reduceOnly": False,
+            "orderLinkId": link, "stopLoss": str(sl), "slTriggerBy": "LastPrice", "tpslMode": "Full"})
+        return link
+
+    def order_status(self, symbol: str, link: str) -> dict | None:
+        """{'status': New|PartiallyFilled|Filled|Cancelled|..., 'filled': qty, 'avg': price} of one order."""
+        for path in ("/v5/order/realtime", "/v5/order/history"):      # open orders, then recent ones
+            rows = self.get(path, category="linear", symbol=symbol, orderLinkId=link).get("list", [])
+            if rows:
+                o = rows[0]
+                return {"status": o.get("orderStatus"), "filled": float(o.get("cumExecQty") or 0),
+                        "avg": float(o.get("avgPrice") or 0)}
+        return None
+
+    def cancel_order(self, symbol: str, link: str) -> None:
+        try:
+            self.post("/v5/order/cancel", {"category": "linear", "symbol": symbol, "orderLinkId": link})
+        except BybitError as e:
+            if e.code not in (110001, 170213):        # "order does not exist": already filled or gone
+                raise
+
     def limit_batch(self, symbol: str, side: str, orders: list[tuple[Decimal, Decimal]]) -> list[str | None]:
         """Reduce-only GTC limit orders [(qty, price), ...] in ONE request. Returns an error message
         (or None) per order. Falls back to one request per order if the batch call is refused; the

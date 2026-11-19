@@ -26,7 +26,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from .notify import coin, usd
+from .notify import coin, r_usd
 from .strategy import Signal
 
 log = logging.getLogger("signals")
@@ -123,6 +123,11 @@ def _append(cfg: dict, row: dict) -> None:
 
 def record(cfg: dict, sig: Signal) -> None:
     """Append a closed trade to the journal. Never raises: a journal line must not stop trading."""
+    if not sig.risk_usd:                     # trades from before $-risk was stored: use the settings
+        try:
+            sig.risk_usd = r_usd(sig, cfg)
+        except (KeyError, ZeroDivisionError, TypeError):
+            pass
     _append(cfg, to_record(sig, "live"))
 
 
@@ -160,6 +165,11 @@ def backfill(cfg: dict, closed: list[Signal]) -> int:
     added = 0
     for sig in closed:
         if sig.status == "closed" and trade_id(sig) not in have:
+            if not sig.risk_usd:
+                try:
+                    sig.risk_usd = r_usd(sig, cfg)
+                except (KeyError, ZeroDivisionError, TypeError):
+                    pass
             _append(cfg, dict(to_record(sig, "live"), backfilled=True))
             added += 1
     return added
@@ -364,7 +374,7 @@ def _variants(cfg: dict) -> list[tuple[str, str, object]]:
     return out
 
 
-def what_if(series: dict, cfg: dict, baseline: list[dict], min_trades: int) -> list[dict]:
+def what_if(series: dict, cfg: dict, baseline: list[dict], min_trades: int, btc_T=None) -> list[dict]:
     """Replay the same history with each variant. 'robust' = more total R than now in BOTH the older
     and the newer half, by a real margin: a change that only helps in one half is luck."""
     from .backtest import simulate
@@ -376,7 +386,7 @@ def what_if(series: dict, cfg: dict, baseline: list[dict], min_trades: int) -> l
     out = []
     for name, key, value in _variants(cfg):
         c = {**cfg, "rules": {**cfg["rules"], key: value}}
-        trades = [to_record(s, "backtest") for sym, (S, T) in series.items() for s in simulate(sym, S, T, c)]
+        trades = [to_record(s, "backtest") for sym, (S, T) in series.items() for s in simulate(sym, S, T, c, btc_T)]
         if not trades:
             continue
         total = sum(t["realized_r"] for t in trades)
@@ -500,7 +510,7 @@ def review(cfg: dict, get=None) -> str:
     """Load history once, replay the current rules and each what-if variant, analyse the journal,
     save the numbered suggestions for /apply, return the report.
     `get` fetches candles (the scanner passes its cache, so only new candles are downloaded)."""
-    from .backtest import load_series, simulate     # imported here: only needed for a review
+    from .backtest import btc_trend, load_series, simulate     # imported here: only needed for a review
     log_dir = Path(cfg["alerts"]["log_dir"])
     pairs = list(dict.fromkeys(cfg["pairs"] + cfg.get("watch_pairs", [])))
 
@@ -514,10 +524,16 @@ def review(cfg: dict, get=None) -> str:
         loaded = dict(zip(pairs, pool.map(one, pairs)))
     series = {p: v for p, v in loaded.items() if v is not None}
     failed = [coin(p) for p, v in loaded.items() if v is None]
-    history = [to_record(s, "backtest") for p, (S, T) in series.items() for s in simulate(p, S, T, cfg)]
+    btc_T = None
+    if cfg["rules"].get("btc_confirm"):
+        try:
+            btc_T = series["BTCUSDT"][1] if "BTCUSDT" in series else btc_trend(cfg, get)
+        except Exception as e:
+            log.warning("review: no Bitcoin trend for the BTC filter: %s", e)
+    history = [to_record(s, "backtest") for p, (S, T) in series.items() for s in simulate(p, S, T, cfg, btc_T)]
     rules = cfg.get("learn_rules", [])
     pool_now = [t for t in history if not _blocked(t, rules)]
-    whatifs = what_if(series, cfg, pool_now, int(cfg.get("learn", {}).get("min_trades", 30)))
+    whatifs = what_if(series, cfg, pool_now, int(cfg.get("learn", {}).get("min_trades", 30)), btc_T)
     text, sugg = build_report(history, load_journal(log_dir), rules, cfg, failed, whatifs)
     save_suggestions(log_dir, sugg)
     return text
@@ -535,7 +551,8 @@ def history_text(cfg: dict, n: int = 10) -> str:
         bybit = f" · Bybit {_money(t['exchange_pnl'])}" if t.get("exchange_pnl") is not None else ""
         lines.append(f"\n{'🟢' if t['side'] == 'LONG' else '🔴'} <b>{coin(t['symbol'])} {t['side'].lower()}</b> · {when}"
                      f"{' · 🤖 Bybit' if t.get('traded') else ' · alert only'}\n"
-                     f"<b>{t['realized_r']:+.2f}R ≈ {_money(money)}</b>{bybit}\n{diagnose(t)[0]}")
+                     f"<b>{t['realized_r']:+.2f}R" + (f" ≈ {_money(money)}" if money else "") + f"</b>{bybit}\n"
+                     f"{diagnose(t)[0]}")
         steps = [e for e in t.get("events", []) if "signal" not in e][-3:]
         if steps:
             lines.append("<i>" + html.escape("  →  ".join(e[6:] for e in steps)) + "</i>")

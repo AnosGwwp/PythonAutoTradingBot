@@ -133,11 +133,20 @@ class LimitEx(FakeEx):
     def __init__(self, **kw):
         super().__init__(**kw)
         self.orders_open = {}
+        self.bid, self.ask = self.price, self.price + 0.01
+        self.moves = []                 # (bid, ask) the market jumps to right after each order
 
-    def entry_limit(self, sym, side, qty, price, sl):
+    def best(self, sym):
+        return self.bid, self.ask
+
+    def entry_limit(self, sym, side, qty, price, sl, post_only=False):
         link = f"L{len(self.orders_open) + 1}"
+        if self.moves:                  # price moves between reading the book and the order landing
+            self.bid, self.ask = self.moves.pop(0)
+        crosses = float(price) >= self.ask if side == "Buy" else float(price) <= self.bid
         self.orders_open[link] = {"sym": sym, "side": side, "qty": float(qty), "price": float(price), "filled": 0.0,
-                                  "status": "New", "sl": sl}
+                                  "status": "Cancelled" if post_only and crosses else "New", "sl": sl,
+                                  "post_only": post_only}
         return link
 
     def fill(self, link, qty=None):
@@ -155,6 +164,11 @@ class LimitEx(FakeEx):
 
 
 class LimitTradingTests(unittest.TestCase):
+    def setUp(self):
+        p = mock.patch("signalbot.trader.POST_ONLY_CHECK_S", 0)
+        p.start()
+        self.addCleanup(p.stop)
+
     def make(self):
         c = trader_cfg()
         c["trading"]["limit_entry"] = True
@@ -280,3 +294,68 @@ class ExtraPairsTest(unittest.TestCase):
         self.assertEqual(set(c["extra_pairs"]), {"BNBUSDT", "HYPEUSDT", "ZECUSDT"})
         self.assertFalse(set(c["extra_pairs"]) & set(c["pairs"]))
         self.assertEqual(c["trading"]["extra_max_open"], 1)
+
+
+class PostOnlyEntryTests(LimitTradingTests):
+    """Entries always pay the maker fee and never a worse price than the signal."""
+
+    def test_rests_at_the_signal_price_as_post_only(self):
+        t, s = self.make(), trader_sig()
+        t.open(s, [], [])
+        o = t.ex.orders_open["L1"]
+        self.assertTrue(o["post_only"])
+        self.assertEqual(o["price"], 100.0)
+
+    def test_uses_the_better_market_price(self):
+        t, s = self.make(), trader_sig()
+        t.ex.bid, t.ex.ask = 99.5, 99.51          # price already dipped below the long's signal price
+        note = t.open(s, [], [])
+        self.assertEqual(s.pending["price"], 99.5)
+        self.assertIn("better than the signal price", note)
+
+    def test_never_pays_more_than_the_signal(self):
+        t, s = self.make(), trader_sig()
+        t.ex.bid, t.ex.ask = 100.4, 100.41        # price above the long's signal: wait for it to come back
+        t.open(s, [], [])
+        self.assertEqual(s.pending["price"], 100.0)
+
+    def test_reprices_when_bybit_cancels_it(self):
+        t, s = self.make(), trader_sig()
+        t.ex.bid, t.ex.ask = 99.5, 99.51
+        t.ex.moves = [(99.0, 99.01)]               # price drops as the 1st order lands: it would cross
+        t.open(s, [], [])
+        self.assertEqual(t.ex.orders_open["L1"]["status"], "Cancelled")
+        self.assertEqual(s.pending["link"], "L2")
+        self.assertEqual(s.pending["price"], 99.0)
+
+    def test_gives_up_after_three_tries(self):
+        t, s = self.make(), trader_sig()
+        t.ex.bid, t.ex.ask = 99.5, 99.51
+        t.ex.moves = [(99.0, 99.01), (98.95, 98.96), (98.9, 98.91)]
+        self.assertIn("couldn't rest on the book", t.open(s, [], []))
+        self.assertFalse(s.pending)
+
+    def test_waiting_order_cancelled_by_bybit_is_replaced(self):
+        t, s = self.make(), trader_sig()
+        t.open(s, [], [])
+        t.ex.orders_open["L1"]["status"] = "Cancelled"
+        self.assertEqual(t.check_pending([s]), [])
+        self.assertEqual(s.pending["link"], "L2")
+        self.assertEqual(s.pending["tries"], 2)
+
+    def test_no_entry_at_or_beyond_the_stop(self):
+        t, s = self.make(), trader_sig()            # stop 98.5
+        t.open(s, [], [])
+        t.ex.orders_open["L1"]["status"] = "Cancelled"
+        t.ex.bid, t.ex.ask = 98.4, 98.41
+        t.check_pending([s])
+        self.assertEqual(len(t.ex.orders_open), 1)   # not re-placed below the stop
+
+    def test_plain_limit_when_post_only_is_off(self):
+        t, s = self.make(), trader_sig()
+        t.cfg["trading"]["post_only"] = False
+        t.ex.bid, t.ex.ask = 99.5, 99.51
+        t.open(s, [], [])
+        o = t.ex.orders_open["L1"]
+        self.assertFalse(o["post_only"])
+        self.assertEqual(o["price"], 100.0)

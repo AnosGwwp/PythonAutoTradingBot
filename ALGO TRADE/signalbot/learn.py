@@ -137,7 +137,7 @@ def on_closed(cfg: dict, st, sig: Signal) -> None:
     record(cfg, sig)
     if sig.traded:
         st.meta.setdefault("pnl_pending", []).append(
-            {"id": trade_id(sig), "symbol": sig.symbol, "from": sig.traded_at,
+            {"id": trade_id(sig), "symbol": sig.symbol, "from": sig.ordered_at or sig.traded_at, "qty": sig.qty,
              "to": sig.closed_at or int(time.time() * 1000), "since": int(time.time() * 1000)})
 
 
@@ -148,7 +148,7 @@ def collect_exchange_pnl(cfg: dict, st, trader, now_ms: int) -> None:
         if now_ms - p["since"] < 120_000:            # give Bybit two minutes to book it
             keep.append(p)
             continue
-        res = trader.realized_pnl(p["symbol"], p["from"], p["to"]) if trader else None
+        res = trader.realized_pnl(p["symbol"], p["from"], p["to"], p.get("qty", 0.0)) if trader else None
         if res is not None:
             _append(cfg, {"type": "exchange_pnl", "id": p["id"], "pnl": round(res[0], 4), "fills": res[1],
                           "at": now_ms})
@@ -483,6 +483,8 @@ def build_report(history: list[dict], live: list[dict], rules: list[dict], cfg: 
     if len(singles) >= 2:
         lines.append("Best: " + "; ".join(f"{html.escape(n)} {st['avg']:+.2f}R" for n, st in reversed(singles[-2:])))
         lines.append("Worst: " + "; ".join(f"{html.escape(n)} {st['avg']:+.2f}R" for n, st in singles[:2]))
+        lines.append("<i>For information only: past best and worst groups (coins especially) often swap "
+                     "later, so don't add or drop coins on this. Only ✅ suggestions held up in both halves.</i>")
 
     # 4. suggestions: skip rules and setting changes, each only with strong evidence
     sugg = [dict(g, type="skip") for g in find_suggestions(history, live, rules, min_trades)] + settings

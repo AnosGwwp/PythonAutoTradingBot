@@ -161,6 +161,11 @@ class Bybit:
         r = self.get("/v5/market/tickers", auth=False, category="linear", symbol=symbol)
         return float(r["list"][0]["lastPrice"])
 
+    def best(self, symbol: str) -> tuple[float, float]:
+        """(best bid, best ask) right now."""
+        t = self.get("/v5/market/tickers", auth=False, category="linear", symbol=symbol)["list"][0]
+        return float(t["bid1Price"]), float(t["ask1Price"])
+
     # ---------------------------------------------------------------- trading
     def one_way_mode(self) -> None:
         self.post("/v5/position/switch-mode", {"category": "linear", "coin": "USDT", "mode": 0})
@@ -184,13 +189,16 @@ class Bybit:
             "price": str(price), "timeInForce": "GTC", "positionIdx": 0, "reduceOnly": reduce,
             "orderLinkId": self._link()}).get("orderId", "")
 
-    def entry_limit(self, symbol: str, side: str, qty: Decimal, price: Decimal, sl: Decimal) -> str:
-        """Opening limit order (GTC) with the stop-loss attached for when it fills. Returns its
-        orderLinkId. If price is already through the limit, it fills at once (at that better price)."""
+    def entry_limit(self, symbol: str, side: str, qty: Decimal, price: Decimal, sl: Decimal,
+                    post_only: bool = False) -> str:
+        """Opening limit order with the stop-loss attached for when it fills. Returns its orderLinkId.
+        GTC: if price is already through the limit it fills at once, as a taker. PostOnly: it only ever
+        rests on the book (maker fee); Bybit cancels it instead if it would fill at once."""
         link = self._link()
         self.post("/v5/order/create", {
             "category": "linear", "symbol": symbol, "side": side, "orderType": "Limit", "qty": str(qty),
-            "price": str(price), "timeInForce": "GTC", "positionIdx": 0, "reduceOnly": False,
+            "price": str(price), "timeInForce": "PostOnly" if post_only else "GTC", "positionIdx": 0,
+            "reduceOnly": False,
             "orderLinkId": link, "stopLoss": str(sl), "slTriggerBy": "LastPrice", "tpslMode": "Full"})
         return link
 

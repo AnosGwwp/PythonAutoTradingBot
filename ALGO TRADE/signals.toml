@@ -10,12 +10,14 @@ pairs = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
 # EXTRA pairs: auto-traded in a lane of their own, so they never take a slot (or a same-direction
 # slot) from the main pairs. Half risk, one open trade at a time across all of them (see [trading]).
-# 1-year test: main lane unchanged, extra lane +2.0R (ZEC +3.5R, HYPE -0.8R, BNB -0.4R) -> small.
-# phone: /extra COIN  ·  /remove COIN
+# Tests: roughly break-even (+2.0R over the year, about 0 in the last 40%), so keep it small: an
+# experiment at half risk. Chosen for liquidity, not past profit: in a 37-coin test, coins picked
+# for past profit did WORSE afterwards. Judge the lane as a whole after ~3 months; don't swap
+# single coins. phone: /extra COIN  ·  /remove COIN
 extra_pairs = ["BNBUSDT", "HYPEUSDT", "ZECUSDT"]
 
 # LOW-PRIORITY pairs: need a stronger setup (watch_min_score) and arrive as SILENT notifications.
-watch_pairs = []
+watch_pairs = ["DOGEUSDT"]
 watch_min_score = 75
 
 entry_tf = "1h"            # timeframe signals are generated on: 15m, 30m, 1h, 2h, 4h
@@ -72,6 +74,9 @@ max_open_trades = 3        # at most this many bot positions at once
 max_same_direction = 2     # at most this many LONGs (or SHORTs) at once: BTC/ETH/SOL usually move together
 extra_max_open = 1         # extra pairs: at most this many open at once (their own slot)
 extra_risk_mult = 0.5      # extra pairs risk this x risk_pct (0.5 = half the normal risk)
+post_only = true           # limit entries are post-only: always the maker fee, placed at the signal price
+                           # or the current best price if that is better (a plain limit fills at once as a
+                           # taker when price is already past it: about +3-4R a year in the backtest)
 limit_entry = true         # enter with a limit order at the signal price (maker fee, better price), valid
                            # for one candle; not filled -> skipped. false = market order at once.
 max_daily_loss_pct = 3     # no NEW trades for the rest of the day once today's loss (closed trades as

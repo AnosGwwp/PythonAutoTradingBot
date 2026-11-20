@@ -110,13 +110,14 @@ class TraderTest(unittest.TestCase):
         return s
 
     def test_daily_loss_limit_uses_bybit_pnl(self):
-        booked = [{"symbol": "ETHUSDT", "closedPnl": "-100"}]
+        NOW = str(int(time.time() * 1000))
+        booked = [{"symbol": "ETHUSDT", "closedPnl": "-100", "updatedTime": NOW}]
         self.assertIn("loss limit", self.make(closed=booked).open(sig(), [], [self.loser()]))  # $100 > $90
         # Bybit booked only -$20 (e.g. the tracker's stop was worse than the real fill): keep trading
         self.assertNotIn("loss limit",
-                         self.make(closed=[{"symbol": "ETHUSDT", "closedPnl": "-20"}]).open(sig(), [], [self.loser()]))
+                         self.make(closed=[{"symbol": "ETHUSDT", "closedPnl": "-20", "updatedTime": NOW}]).open(sig(), [], [self.loser()]))
         # other coins on the account (not bot trades) don't count
-        other = [{"symbol": "XRPUSDT", "closedPnl": "-500"}]
+        other = [{"symbol": "XRPUSDT", "closedPnl": "-500", "updatedTime": NOW}]
         self.assertNotIn("loss limit", self.make(closed=other).open(sig(), [], [self.loser()]))
 
     def test_daily_loss_limit_falls_back_to_tracked_results(self):
@@ -169,6 +170,16 @@ class TraderTest(unittest.TestCase):
         t.open(s, [], [])
         self.assertEqual(len(s.tps), 1)                      # tracker now closes all at TP1, like Bybit
 
+    def test_daily_loss_counts_a_stop_placed_yesterday(self):
+        # Bybit dates the record by when the stop ORDER was made (yesterday); it FILLED today
+        day = 86_400_000
+        now = int(time.time() * 1000)
+        booked = [{"symbol": "ETHUSDT", "closedPnl": "-100", "createdTime": str(now - day), "updatedTime": str(now)},
+                  {"symbol": "ETHUSDT", "closedPnl": "-500", "createdTime": str(now - 2 * day),
+                   "updatedTime": str(now - 2 * day)}]                       # filled two days ago: not today
+        t = self.make(closed=booked)
+        self.assertAlmostEqual(t.today_loss([self.loser()]), 100.0)
+
     def test_sync_uses_real_exit_price(self):
         t = self.make(closed=[{"symbol": "BTCUSDT", "avgExitPrice": "101.25"}])
         s = sig()
@@ -193,11 +204,19 @@ class TraderTest(unittest.TestCase):
         self.assertIsNone(t.ex.position("BTCUSDT"))
 
     def test_sync_needs_two_misses(self):
-        t = self.make()
+        t = self.make(closed=[{"symbol": "BTCUSDT", "avgExitPrice": "99"}])
         s = sig()
         s.traded, s.traded_at = True, 0
         self.assertEqual(t.sync([s]), [])                    # 1st miss: wait (stop may be in flight)
         self.assertEqual(len(t.sync([s])), 1)                # 2nd miss: closed on Bybit
+
+    def test_sync_falls_back_to_last_price_if_bybit_never_books_it(self):
+        t = self.make(price=97.0)
+        s = sig()
+        s.traded, s.traded_at = True, 0
+        out = [t.sync([s]) for _ in range(12)]
+        self.assertEqual(out[:-1], [[]] * 11)                # waiting for Bybit's record
+        self.assertEqual(out[-1][0][1], 97.0)
 
     def test_bybit_5xx_is_uncertain_4xx_is_rejected(self):
         from unittest import mock

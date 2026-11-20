@@ -263,6 +263,11 @@ full history is in `logs/signals.csv`.
   costs about 0.075R, because the median stop is only 1.3% away.
 - **Limit entries** (`trading.limit_entry`) use the maker fee and enter at the signal price,
   which is worth about +0.03R per trade. 98% of them filled within one candle.
+- **Post-only entries** (`trading.post_only`, on): a plain limit order fills at once, and pays the
+  taker fee, when price is already past it. That happened live, so live results were quietly worse
+  than the backtest. Entries are now post-only, placed at the signal price or the current best
+  price when that is better. They always pay the maker fee, never a worse price than the signal,
+  and re-price if Bybit cancels them (up to 3 tries at once, 5 in total). About +3–4R a year.
 - **The 4 filters** (`[rules]`, all on):
   - skip trades whose real stop is wider than the cap
   - require a clear 4h trend (EMA50 at least 1% from EMA200)
@@ -301,9 +306,14 @@ strength 70+.
 slots or the 2-per-direction limit. Instead they share **one slot** (`extra_max_open = 1`) and risk
 **half** the normal amount (`extra_risk_mult = 0.5`). Same strategy and filters otherwise.
 
-1-year test with this setup: main lane unchanged (+23.0R), extra lane **+2.0R** on top. Per coin:
-ZEC +3.5R, HYPE −0.8R, BNB −0.4R, so the gain is small and mostly from ZEC. `/review` shows how
-they do live; `/remove HYPE` (or BNB) if they keep losing.
+1-year test with this setup: main lane unchanged (+23.0R), extra lane **+2.0R** on top, but about
+break-even in the last 40% of the year. Treat it as a small experiment and judge the lane as a
+whole after ~3 months.
+
+**Don't pick coins by past profit.** In a 37-coin test, the coins that did best in the first 60%
+of the year did *worse* afterwards (rank correlation −0.32), and re-picking last months' winners
+every month lost the most. The extras were chosen for liquidity on Bybit instead. The review's
+"Best / Worst" line is for information only.
 - **`/review` now tests on a full year** (`[learn] history_bars`), because 125 days produced
   suggestions that didn't hold up.
 

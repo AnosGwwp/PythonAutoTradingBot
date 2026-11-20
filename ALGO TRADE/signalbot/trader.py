@@ -41,6 +41,13 @@ def _same_price(a, b, tick: str) -> bool:
     return fa is not None and fb is not None and round_tick(fa, tick) == round_tick(fb, tick)
 
 
+# Bybit dates closed-P&L records by order creation: look back this far for orders (e.g. the stop
+# placed with the entry) that filled later. Covers a trade's whole life on the 1h chart.
+FILL_LOOKBACK_MS = 3 * 86_400_000
+POST_ONLY_CHECK_S = 0.3                    # wait before checking a post-only entry was accepted
+DEAD = ("Cancelled", "Rejected", "Deactivated")    # order statuses: gone without a fill
+
+
 class Trader:
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -168,16 +175,20 @@ class Trader:
 
         ex.set_leverage(sym, lev)
         attached_sl = round_tick(plan.sl, info["tick"])
+        sig.ordered_at = int(time.time() * 1000)
         if limit:
-            price_ = round_tick(sig.entry, info["tick"])
-            link = ex.entry_limit(sym, "Buy" if long else "Sell", qty, price_, attached_sl)
+            placed = self._place_entry(sig, info, qty, attached_sl)
+            if not placed:
+                return "🤖 Not auto-traded: price kept moving, so the entry order couldn't rest on the book."
+            link, price_ = placed
             until = int(time.time() * 1000) + TF_MS[sig.tf]
             sig.pending = {"link": link, "price": float(price_), "qty": float(qty), "lev": lev,
-                           "sl": float(attached_sl), "until": until, "capital": capital}
+                           "sl": float(attached_sl), "until": until, "capital": capital, "tries": 1}
+            better = " (better than the signal price)" if sig.d * (float(price_) - sig.entry) < 0 else ""
             return (f"🤖 <b>Limit order on {self.label}</b>: {'buy' if long else 'sell'} {qty} {coin(sym)} at "
-                    f"<b>{px(float(price_))}</b> with the stop attached, valid until "
+                    f"<b>{px(float(price_))}</b>{better} with the stop attached, valid until "
                     f"{time.strftime('%H:%M', time.localtime(until / 1000))}.\n"
-                    f"      Cheaper fee and a better price than buying at market. If price doesn't come back to "
+                    f"      Maker fee, never a worse price than the signal. If price doesn't come back to "
                     f"it, the trade is skipped.")
         try:
             ex.market(sym, "Buy" if long else "Sell", qty, sl=attached_sl)
@@ -223,6 +234,34 @@ class Trader:
             msg += "\n⚠️ " + html.escape("; ".join(problems))
         return msg
 
+    def _maker_price(self, sig: Signal, info: dict) -> Decimal:
+        """Where a resting entry goes: the signal price, or the current best bid (long) / ask (short)
+        when that is better, so the order sits on the book (maker) and never pays more than planned."""
+        if not self.t.get("post_only", True):
+            return round_tick(sig.entry, info["tick"])
+        bid, ask = self.ex.best(sig.symbol)
+        best = min(sig.entry, bid) if sig.d == 1 else max(sig.entry, ask)
+        return round_tick(best, info["tick"])
+
+    def _place_entry(self, sig: Signal, info: dict, qty, sl) -> tuple[str, Decimal] | None:
+        """Place the entry limit order. Post-only (the default): if price moved and Bybit cancels it
+        rather than fill it as a taker, re-price at the new best price, up to 3 tries."""
+        post = bool(self.t.get("post_only", True))
+        side = "Buy" if sig.d == 1 else "Sell"
+        for _ in range(3 if post else 1):
+            price_ = self._maker_price(sig, info)
+            if sig.d * (float(price_) - sig.sl) <= 0:
+                return None                                 # price is at the stop: no trade
+            link = self.ex.entry_limit(sig.symbol, side, qty, price_, sl, post_only=post)
+            if not post:
+                return link, price_
+            time.sleep(POST_ONLY_CHECK_S)
+            st = self.ex.order_status(sig.symbol, link) or {}
+            if not (st.get("status") in DEAD and not float(st.get("filled") or 0)):
+                return link, price_
+            log.info("%s: post-only entry at %s would have taken liquidity; re-pricing", sig.symbol, price_)
+        return None
+
     # ---------------------------------------------------------------- limit entries waiting for a fill
     def check_pending(self, open_sigs: list[Signal]) -> list[tuple[Signal, str]]:
         """Each poll: did a waiting limit entry fill? Filled -> take-profits go on, the bot manages it.
@@ -243,6 +282,14 @@ class Trader:
                     continue
                 st = self.ex.order_status(s.symbol, p["link"]) or {}
                 filled = float(st.get("filled") or 0)
+                if st.get("status") in DEAD and not filled and now < p["until"] and p.get("tries", 1) < 5:
+                    # Bybit cancelled the post-only order (it would have filled as a taker): re-place it
+                    placed = self._place_entry(s, self.ex.instrument(s.symbol), Decimal(str(p["qty"])),
+                                               Decimal(str(p["sl"])))
+                    if placed:
+                        p.update(link=placed[0], price=float(placed[1]), tries=p.get("tries", 1) + 1)
+                        log.info("%s: entry re-placed at %s", s.symbol, placed[1])
+                        continue
                 done = st.get("status") == "Filled" or filled >= p["qty"] * 0.999
                 if not done and now < p["until"]:
                     continue                                    # still waiting
@@ -352,14 +399,18 @@ class Trader:
             if s.symbol in pos or now - s.traded_at < 60_000:
                 self.missing.pop(s.symbol, None)
                 continue
-            self.missing[s.symbol] = self.missing.get(s.symbol, 0) + 1
-            if self.missing[s.symbol] >= 2:
-                self.missing.pop(s.symbol)
-                try:
-                    self.ex.cancel_all(s.symbol)
-                    gone.append((s, self._exit_price(s)))
-                except BybitError as e:
-                    log.warning("bybit sync %s: %s", s.symbol, e)
+            n = self.missing[s.symbol] = self.missing.get(s.symbol, 0) + 1
+            if n < 2:
+                continue
+            exit_px = self._exit_price(s)
+            if exit_px is None and n < 12:            # Bybit hasn't booked the close yet: ask again
+                continue
+            self.missing.pop(s.symbol)
+            try:
+                self.ex.cancel_all(s.symbol)
+                gone.append((s, exit_px or self.ex.last_price(s.symbol)))
+            except BybitError as e:
+                log.warning("bybit sync %s: %s", s.symbol, e)
         return gone
 
     # ---------------------------------------------------------------- stop checks
@@ -411,17 +462,29 @@ class Trader:
                                f"refused the fix ({html.escape(str(e))}). Check it in the app."))
         return out
 
-    def realized_pnl(self, symbol: str, start_ms: int, end_ms: int) -> tuple[float, int] | None:
-        """What Bybit booked for one trade: (net P&L in USDT incl. fees, number of closing fills)."""
+    def _fills(self, symbol: str | None, since_ms: int, until_ms: int | None = None) -> list[dict]:
+        """Bybit closed-P&L records that FILLED between since and until, oldest fill first.
+
+        Bybit dates (and filters) these records by when their ORDER was created, not when it
+        filled: a stop placed together with the entry is "older" than the take-profit orders even
+        when it fills last. So ask from well before and keep what filled in the window."""
+        rows = self.ex.closed_pnl(symbol, start_ms=max(0, since_ms - FILL_LOOKBACK_MS), limit=100)
+        def filled(r):
+            return int(r.get("updatedTime") or r.get("createdTime") or 0)
+        return sorted((r for r in rows if filled(r) >= since_ms and (until_ms is None or filled(r) <= until_ms)),
+                      key=filled)
+
+    def realized_pnl(self, symbol: str, start_ms: int, end_ms: int, qty: float = 0.0) -> tuple[float, int] | None:
+        """What Bybit booked for one trade: (net P&L in USDT incl. fees, number of closing fills).
+        None if nothing (or, given qty, not the whole position) is booked yet."""
         if self.ex is None:
             return None
         try:
-            rows = self.ex.closed_pnl(symbol, start_ms=max(0, start_ms - 1000), limit=50)
-        except BybitError as e:
+            mine = self._fills(symbol, start_ms - 1000, end_ms + 600_000)
+        except (BybitError, ValueError, TypeError) as e:
             log.warning("bybit closed P&L %s: %s", symbol, e)
             return None
-        mine = [r for r in rows if int(r.get("createdTime") or r.get("updatedTime") or 0) <= end_ms + 600_000]
-        if not mine:
+        if not mine or (qty > 0 and sum(float(r.get("closedSize") or 0) for r in mine) < qty * 0.999):
             return None
         return sum(float(r.get("closedPnl") or 0) for r in mine), len(mine)
 
@@ -444,17 +507,29 @@ class Trader:
         except BybitError as e:
             log.warning("%s: early stop move failed (%s); the tracker retries at the candle close", sig.symbol, e)
 
-    def _exit_price(self, sig: Signal) -> float:
-        """Average price of the latest closing fill on Bybit since the trade opened, so a trade you
-        closed in the app is recorded at your real exit (falls back to the last price)."""
+    def _exit_price(self, sig: Signal) -> float | None:
+        """The real average exit of what the tracker still holds (the position closed on Bybit:
+        stop, your own close in the app, ...): the latest closing fills covering the open remainder.
+        None if Bybit hasn't booked the whole close yet."""
         try:
-            for r in self.ex.closed_pnl(sig.symbol, start_ms=sig.traded_at or None, limit=1):
-                p = float(r.get("avgExitPrice") or 0)
-                if p > 0:
-                    return p
+            rows = self._fills(sig.symbol, (sig.ordered_at or sig.traded_at) - 1000)
         except (BybitError, ValueError, TypeError) as e:
             log.warning("bybit exit price %s: %s", sig.symbol, e)
-        return self.ex.last_price(sig.symbol)
+            return None
+        want = sig.remaining * sig.qty
+        if want <= 0:                       # size unknown: the latest fill
+            p = float(rows[-1].get("avgExitPrice") or 0) if rows else 0.0
+            return p or None
+        got = value = 0.0
+        for r in reversed(rows):            # newest fill first
+            q, p = float(r.get("closedSize") or 0), float(r.get("avgExitPrice") or 0)
+            if q <= 0 or p <= 0:
+                continue
+            take = min(q, want - got)
+            got, value = got + take, value + take * p
+            if got >= want * 0.999:
+                return value / got
+        return None
 
     def orphans(self, open_sigs: list[Signal]) -> list[str]:
         """Coins with a Bybit position that this bot isn't managing."""
@@ -480,7 +555,7 @@ class Trader:
         if self.ex is not None and (closed_today or open_traded):
             syms = {s.symbol for s in closed_today + open_traded}
             try:
-                pnl = sum(float(r.get("closedPnl") or 0) for r in self.ex.closed_pnl(start_ms=start)
+                pnl = sum(float(r.get("closedPnl") or 0) for r in self._fills(None, start)
                           if r.get("symbol") in syms)
             except (BybitError, ValueError, TypeError) as e:
                 log.warning("bybit closed P&L unavailable, using tracked results: %s", e)

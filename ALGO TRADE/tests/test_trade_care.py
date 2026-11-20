@@ -94,6 +94,44 @@ class StopCareTests(unittest.TestCase):
         self.assertIn("refused", first[0][1])
         self.assertEqual(again, [])
 
+    def bybit_sol_trade(self):
+        """The real SOL short of 20 Nov: limit entry 26.3 @ 73.03 with the stop attached, TP1 8.7 filled,
+        then the stop (moved to entry) closed the other 17.6. Bybit lists the stop's record as the
+        OLDER one, because its order was created first."""
+        t, _ = self.make()
+        entry_order, tp_orders, tp1_fill, stop_fill = 1_000_000, 1_013_000, 4_245_000, 8_226_000
+        t.ex.closed = [
+            {"symbol": "SOLUSDT", "closedPnl": "9.396", "closedSize": "8.7", "avgExitPrice": "71.89",
+             "createdTime": str(tp_orders), "updatedTime": str(tp1_fill)},
+            {"symbol": "SOLUSDT", "closedPnl": "-1.555", "closedSize": "17.6", "avgExitPrice": "73.03",
+             "createdTime": str(entry_order), "updatedTime": str(stop_fill)}]
+        s = Signal("SOLUSDT", "SHORT", "1h", 0, 73.03, 74.17, [71.89, 70.75, 69.62], 70, ["pullback"], ["x"], 1.0,
+                   sl_now=73.03)
+        s.traded, s.qty, s.ordered_at, s.traded_at = True, 26.3, entry_order, entry_order + 12_000
+        s.tp_hit, s.remaining = 1, 2 / 3
+        return t, s, stop_fill
+
+    def test_exit_price_is_the_last_fill_not_the_newest_order(self):
+        t, s, _ = self.bybit_sol_trade()
+        self.assertAlmostEqual(t._exit_price(s), 73.03)               # the stop at entry, not TP1's 71.89
+
+    def test_exit_price_waits_until_bybit_booked_the_close(self):
+        t, s, _ = self.bybit_sol_trade()
+        t.ex.closed = t.ex.closed[:1]                                 # only TP1 booked so far
+        self.assertIsNone(t._exit_price(s))
+        t.ex.pos = {}
+        s.traded_at = 0
+        t.sync([s])
+        self.assertEqual(t.sync([s]), [])                             # position gone, but no exit yet: wait
+
+    def test_realized_pnl_includes_the_stop_placed_with_the_entry(self):
+        t, s, stop_fill = self.bybit_sol_trade()
+        pnl, n = t.realized_pnl("SOLUSDT", s.ordered_at, stop_fill, qty=26.3)
+        self.assertAlmostEqual(pnl, 7.841)
+        self.assertEqual(n, 2)
+        t.ex.closed = t.ex.closed[:1]
+        self.assertIsNone(t.realized_pnl("SOLUSDT", s.ordered_at, stop_fill, qty=26.3))   # not all booked yet
+
     def test_realized_pnl_sums_bybit_records_of_the_trade(self):
         t, _ = self.make()
         t.ex.closed = [{"symbol": "BTCUSDT", "closedPnl": "10.5", "createdTime": "5000"},

@@ -71,6 +71,7 @@ class Signal:
     traded: bool = False      # auto-traded on the exchange
     qty: float = 0.0          # filled size on the exchange
     traded_at: int = 0        # ms
+    ordered_at: int = 0       # ms the entry order was sent (its attached stop is dated from then on Bybit)
     pending: dict = field(default_factory=dict)   # limit entry waiting for a fill (link, price, until...)
     # --- for learning (see learn.py) ---
     features: dict = field(default_factory=dict)   # indicator values on the signal candle
